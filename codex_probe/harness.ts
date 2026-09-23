@@ -16,122 +16,55 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline from 'node:readline';
-import type {
-  ClientRequest,
-  ServerNotification,
-  ServerRequest,
-} from '../src/codex/codex-schema';
-
-/** Every method the pinned app-server accepts as a client request. */
-export type RpcMethod = ClientRequest['method'];
-
-/** Params the pinned schema defines for one method. */
-export type RpcParams<M extends RpcMethod> = Extract<
-  ClientRequest,
-  { method: M }
->['params'];
-
-/** `Omit` that maps over a union instead of collapsing it to its shared keys. */
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
-  ? Omit<T, K>
-  : never;
-
-/**
- * One method paired with that method's params, as a discriminated union.
- *
- * The pairing has to live in the TYPE rather than rely on inference. An earlier
- * signature took the method and params as two arguments and inferred the method
- * from the first — which TypeScript silently abandons the moment a caller names
- * any type argument, because it has no partial type-argument inference. Every
- * probe named the result type, so every probe fell back to the default `M` (the
- * whole method union), `RpcParams<M>` widened to the union of all params, and a
- * `turn/start` call carrying `thread/start` params compiled without a word.
- * Correlating the two fields here restores the check regardless of what the
- * caller does with the result type.
- */
-export type RpcCall = DistributiveOmit<ClientRequest, 'id'>;
-
-/** One JSON-RPC reply. Errors are returned, not thrown: a refusal is data. */
-export interface RpcReply<T> {
-  result?: T;
-  error?: { code: number; message: string; data?: unknown };
-}
-
-/** Method names the pinned schema exports, for reference at call sites. */
-export type KnownNotification = ServerNotification['method'];
-export type KnownServerRequest = ServerRequest['method'];
-
-/**
- * A server-initiated notification, kept verbatim for later inspection.
- *
- * `method` is a plain string rather than {@link KnownNotification}: a method
- * the exported schema does not list is precisely what a probe is looking for,
- * and narrowing here would hide it. (It would not even narrow — a union of a
- * literal type with `string` collapses to `string`.)
- */
-export interface Note {
-  method: string;
-  params: Record<string, unknown>;
-}
-
-/** A server-initiated request, which the client must answer. */
-export interface IncomingRequest {
-  id: number | string;
-  /** Plain string for the same reason as {@link Note.method}. */
-  method: string;
-  params: Record<string, unknown>;
-}
-
-/** Outcome of one turn driven to completion. */
-export interface TurnRun {
-  turnId?: string;
-  /** Notifications emitted from `turn/start` until this turn completed. */
-  events: Note[];
-  /** Server requests received while it ran, in arrival order. */
-  requests: IncomingRequest[];
-  /** True when the turn completed rather than running out of time. */
-  completed: boolean;
-  /** Set when `turn/start` itself was refused. */
-  error?: RpcReply<unknown>['error'];
-}
-
-export interface AppServerOptions {
-  /** Path to the codex binary. Defaults to the repo's pinned dependency. */
-  bin?: string;
-  /** CODEX_HOME for this run. */
-  home: string;
-  /** How to answer server-initiated requests. Defaults to accepting approvals. */
-  onServerRequest?: (request: IncomingRequest) => unknown;
-  /** Extra environment for the child. */
-  env?: Record<string, string>;
-}
-
-/** Answers approvals with `accept`, everything else with an empty result. */
-function defaultServerResponse(request: IncomingRequest): unknown {
-  return request.method.endsWith('requestApproval')
-    ? { decision: 'accept' }
-    : {};
-}
+import { delay } from './utils';
+import { nativeCodexBinary } from './native-binary';
+export { delay, itemType, text } from './utils';
+import {
+  defaultServerResponse,
+  errorPayload,
+  HOLD,
+  isErrorReply,
+  type AppServerOptions,
+  type ErrorReply,
+  type IncomingRequest,
+  type Note,
+  type RpcCall,
+  type RpcReply,
+  type TurnRun,
+} from './harness-types';
+export * from './harness-types';
 
 export class AppServer {
   private readonly child: ChildProcessWithoutNullStreams;
   private nextId = 0;
   private readonly pending = new Map<
     number,
-    (reply: RpcReply<unknown>) => void
+    {
+      resolve: (reply: RpcReply<unknown>) => void;
+      reject: (error: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
   >();
+  private transportError: Error | null = null;
   private stderrBuffer = '';
 
   /** Every notification received, oldest first. */
   readonly notes: Note[] = [];
   /** Every server-initiated request received, oldest first. */
   readonly requests: IncomingRequest[] = [];
+  /** Requests a responder chose to hold, keyed by request id. */
+  private readonly heldById = new Map<string, IncomingRequest>();
+  /** Shared arrival counter across both incoming kinds; see {@link IncomingRequest.arrival}. */
+  private arrivals = 0;
 
   private constructor(
     child: ChildProcessWithoutNullStreams,
-    private readonly respond: (request: IncomingRequest) => unknown,
+    private respond: (request: IncomingRequest) => unknown,
   ) {
     this.child = child;
+    child.once('exit', () => this.failPending(new Error('App-server exited')));
+    child.on('error', (error) => this.failPending(error));
+    child.stdin.on('error', (error) => this.failPending(error));
     this.child.stderr.on('data', (chunk: Buffer) => {
       this.stderrBuffer += chunk.toString();
     });
@@ -149,29 +82,42 @@ export class AppServer {
    * @returns A connected app-server ready for requests
    */
   static async start(options: AppServerOptions): Promise<AppServer> {
-    const bin = options.bin ?? 'codex';
-    const child = spawn(bin, ['app-server'], {
+    const native = nativeCodexBinary(options.bin);
+    const child = spawn(native.executable, ['app-server'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...options.env, CODEX_HOME: options.home },
+      cwd: options.cwd,
+      env: {
+        ...process.env,
+        ...options.env,
+        CODEX_HOME: options.home,
+        CODEX_MANAGED_PACKAGE_ROOT: native.packageRoot,
+      },
     });
     const app = new AppServer(
       child,
       options.onServerRequest ?? defaultServerResponse,
     );
-    await app.request({
-      method: 'initialize',
-      params: {
-        clientInfo: {
-          name: 'codex-webui-probe',
-          title: 'codex-webui probe',
-          version: '0.0.0',
+    try {
+      const initialized = await app.request({
+        method: 'initialize',
+        params: {
+          clientInfo: {
+            name: 'codex-webui-probe',
+            title: 'codex-webui probe',
+            version: '0.0.0',
+          },
+          // `requestAttestation` is required since 0.149.0; probes cannot attest.
+          capabilities: { experimentalApi: true, requestAttestation: false },
         },
-        // `requestAttestation` is required since 0.149.0; probes cannot attest.
-        capabilities: { experimentalApi: true, requestAttestation: false },
-      },
-    });
-    app.notify('initialized');
-    return app;
+      });
+      if (initialized.error)
+        throw new Error(`Initialize failed: ${initialized.error.message}`);
+      app.notify('initialized');
+      return app;
+    } catch (error) {
+      if (child.pid !== undefined) await app.kill();
+      throw error;
+    }
   }
 
   /** Routes one stdout line: reply, server request, or notification. */
@@ -193,26 +139,52 @@ export class AppServer {
         id,
         method,
         params: (message.params ?? {}) as Record<string, unknown>,
+        arrival: this.arrivals++,
       };
       this.requests.push(request);
-      this.send({ id, result: this.respond(request) });
+      const reply = this.respond(request);
+      // A held request stays unanswered until the probe releases it, which is
+      // what keeps the agent genuinely blocked while the probe observes.
+      if (reply === HOLD) {
+        this.heldById.set(String(id), request);
+        return;
+      }
+      if (isErrorReply(reply)) {
+        this.send({ id, error: errorPayload(reply) });
+        return;
+      }
+      this.send({ id, result: reply });
       return;
     }
     if (typeof id === 'number' && this.pending.has(id)) {
-      this.pending.get(id)!(message);
+      const pending = this.pending.get(id)!;
+      clearTimeout(pending.timer);
       this.pending.delete(id);
+      pending.resolve(message);
       return;
     }
     if (method) {
       this.notes.push({
         method,
         params: (message.params ?? {}) as Record<string, unknown>,
+        arrival: this.arrivals++,
       });
     }
   }
 
   private send(message: Record<string, unknown>): void {
+    if (this.transportError) throw this.transportError;
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  /** Rejects outstanding RPCs on transport loss without answering held server requests. */
+  private failPending(error: Error): void {
+    this.transportError = error;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   /**
@@ -224,14 +196,15 @@ export class AppServer {
    * rather than through inference.
    *
    * @param call - A method paired with that method's params
+   * @param timeoutMs - Response deadline, independent of turn or held-operation waits
    * @returns The reply, whose `error` is data rather than an exception
+   * @throws On transport loss or deadline; never retries a possibly accepted request
    */
-  request<Result = unknown>(call: RpcCall): Promise<RpcReply<Result>> {
-    return new Promise((resolve) => {
-      const id = ++this.nextId;
-      this.pending.set(id, resolve as (reply: RpcReply<unknown>) => void);
-      this.send({ id, ...call });
-    });
+  request<Result = unknown>(
+    call: RpcCall,
+    timeoutMs = 30_000,
+  ): Promise<RpcReply<Result>> {
+    return this.requestRaw<Result>(call.method, call.params, timeoutMs);
   }
 
   /**
@@ -247,22 +220,120 @@ export class AppServer {
    *
    * @param method - A method name the schema does not define
    * @param params - Params sent verbatim, unchecked
+   * @param timeoutMs - Response deadline; does not release held operations
    * @returns The reply, whose `error` is data rather than an exception
    */
   requestRaw<Result = unknown>(
     method: string,
     params?: Record<string, unknown>,
+    timeoutMs = 30_000,
   ): Promise<RpcReply<Result>> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      if (this.transportError) throw this.transportError;
       const id = ++this.nextId;
-      this.pending.set(id, resolve as (reply: RpcReply<unknown>) => void);
-      this.send({ id, method, params });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(
+          new Error(
+            `RPC deadline exceeded: ${method} (${timeoutMs}ms); delivery unknown`,
+          ),
+        );
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: resolve as (reply: RpcReply<unknown>) => void,
+        reject,
+        timer,
+      });
+      try {
+        this.send({ id, method, params });
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
   /** Sends a notification, which has no reply. */
   notify(method: string, params: Record<string, unknown> = {}): void {
     this.send({ method, params });
+  }
+
+  /**
+   * Replaces the server-request policy after the connection is up.
+   *
+   * A probe usually only knows which requests it wants to hold once it has
+   * decided what it is measuring, which is after {@link start} has run.
+   *
+   * @param respond - Returns the result to send, or {@link HOLD} to withhold it
+   */
+  setServerResponder(respond: (request: IncomingRequest) => unknown): void {
+    this.respond = respond;
+  }
+
+  /**
+   * Waits until a server-initiated request satisfies a predicate.
+   *
+   * Separate from {@link waitFor} because requests and notifications are
+   * different streams; a request that never arrives means the fixture failed to
+   * provoke the thing under measurement, which is not the same as a timeout
+   * waiting for an event.
+   *
+   * @param predicate - Tested against every request from `from` onwards
+   * @param options - Where to start looking and how long to wait
+   * @returns The matching request, or undefined on timeout
+   */
+  async waitForRequest(
+    predicate: (request: IncomingRequest) => boolean,
+    options: { from?: number; timeoutMs?: number } = {},
+  ): Promise<IncomingRequest | undefined> {
+    const from = options.from ?? 0;
+    const deadline = Date.now() + (options.timeoutMs ?? 120_000);
+    for (;;) {
+      const found = this.requests.slice(from).find(predicate);
+      if (found) return found;
+      if (Date.now() >= deadline) return undefined;
+      await delay(200);
+    }
+  }
+
+  /** Server requests currently held unanswered, in arrival order. */
+  held(): IncomingRequest[] {
+    return [...this.heldById.values()];
+  }
+
+  /**
+   * Answers a request that was held, unblocking the agent.
+   *
+   * @param id - Request id, as delivered
+   * @param result - The JSON-RPC result to send
+   * @throws Error when that id is not being held, so a probe cannot silently
+   *   believe it released something it never held
+   */
+  release(id: number | string, result: unknown): void {
+    const key = String(id);
+    if (!this.heldById.delete(key))
+      throw new Error(`Request ${key} is not held; nothing to release`);
+    this.send({ id, result });
+  }
+
+  /**
+   * Refuses a held request with a JSON-RPC error instead of a result.
+   *
+   * This is the disposition a client has when it genuinely cannot answer — it
+   * neither approves anything nor leaves the agent blocked. What app-server
+   * does with it is not documented anywhere, so it has to be measured before
+   * any production code relies on it.
+   *
+   * @param id - Request id, as delivered
+   * @param error - The refusal to send, built with {@link rpcError}
+   * @throws Error when that id is not being held
+   */
+  releaseWithError(id: number | string, error: ErrorReply): void {
+    const key = String(id);
+    if (!this.heldById.delete(key))
+      throw new Error(`Request ${key} is not held; nothing to refuse`);
+    this.send({ id, error: errorPayload(error) });
   }
 
   /** Notifications received since a previously recorded mark. */
@@ -349,33 +420,72 @@ export class AppServer {
     return this.stderrBuffer;
   }
 
+  /**
+   * Starts bounded normal teardown for legacy callers that do not await close.
+   * A failed confirmation makes their entire run inconclusive. Sequential
+   * measurements and the shared runner await kill('SIGTERM') instead.
+   */
   close(): void {
-    this.child.kill();
+    void this.kill('SIGTERM').catch((error: unknown) => {
+      console.error('INCONCLUSIVE: native close could not be confirmed', error);
+      process.exitCode = 2;
+    });
   }
-}
 
-/** Sleeps, for settling windows where no notification marks the boundary. */
-export function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/** Reads an item's protocol type, which differs by view between snake and camel. */
-export function itemType(item: unknown): string {
-  const record = (item ?? {}) as Record<string, unknown>;
-  return text(record.item_type) || text(record.type) || 'unknown';
-}
-
-/**
- * Renders an unknown protocol value as text without stringifying an object.
- *
- * Probe output is read by a human comparing orders and statuses, and a stray
- * `[object Object]` in that list is indistinguishable from a real value.
- *
- * @param value - Any field read off an untyped protocol payload
- * @returns The value when it is a string or number, otherwise an empty string
- */
-export function text(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number') return String(value);
-  return '';
+  /**
+   * Signals the directly spawned native process and requires its actual exit.
+   * Signal delivery alone is not termination. There is no wrapper between this
+   * child handle and Codex, including for SIGKILL, which cannot be forwarded.
+   *
+   * @param signal - Signal to send; the default cannot be caught or handled
+   * @returns Native process identity and observed termination, for measurement output
+   * @throws If signal delivery fails or the child does not exit within ten seconds
+   */
+  kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<{
+    pid: number | undefined;
+    executable: string;
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }> {
+    const evidence = () => ({
+      pid: this.child.pid,
+      executable: this.child.spawnfile,
+      code: this.child.exitCode,
+      signal: this.child.signalCode,
+    });
+    if (this.child.exitCode !== null || this.child.signalCode !== null) {
+      return Promise.resolve(evidence());
+    }
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.child.off('exit', onExit);
+        this.child.off('error', onError);
+      };
+      const onExit = () => {
+        cleanup();
+        resolve(evidence());
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        onError(
+          new Error(
+            `INCONCLUSIVE: native process did not exit after ${signal}`,
+          ),
+        );
+      }, 10_000);
+      this.child.once('exit', onExit);
+      this.child.once('error', onError);
+      try {
+        if (!this.child.kill(signal)) {
+          onError(new Error(`Could not deliver ${signal} to child`));
+        }
+      } catch (error) {
+        onError(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
 }

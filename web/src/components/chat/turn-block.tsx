@@ -2,6 +2,7 @@
  * Renders a single AI turn as a unified block.
  * Contains all items (reasoning, tool calls, messages) under one avatar.
  */
+import { pendingRequestKey } from '@/lib/pending-request-identity';
 import { Bot, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useShallow } from 'zustand/react/shallow';
@@ -28,7 +29,6 @@ import {
   UnknownActivityItem,
   WebSearchItem,
 } from './turn-items/rich-activity-items';
-import { useTurnItemsTopUp } from '@/hooks/use-turn-items-topup';
 import {
   isPlanDisplayable,
   isTurnItemDisplayable,
@@ -95,7 +95,7 @@ function assertNever(value: never): never {
  * id: resolving them per item would rescan the whole map on every item render
  * and re-render every item whenever any approval anywhere changed.
  */
-function ItemWithRequests({
+function ItemBody({
   item,
   turnId,
   approvals,
@@ -113,7 +113,7 @@ function ItemWithRequests({
   });
 
   const inputCard = userInputRequest ? (
-    <UserInputCard key={String(userInputRequest.requestId)} request={userInputRequest} />
+    <UserInputCard key={pendingRequestKey(userInputRequest)} request={userInputRequest} />
   ) : null;
 
   switch (item.type) {
@@ -151,18 +151,23 @@ function ItemWithRequests({
           {inputCard}
         </>
       );
-    case 'fileChange':
+    case 'fileChange': {
+      const files = approvals.filter((approval) => approval.kind === 'fileChange');
+      const primary = files.find((approval) => approval.status === 'pending') ?? files[0];
       return (
         <>
           <FileChangeItem
             item={item}
-            approval={approvals.find(
-              (approval) => approval.kind === 'fileChange',
-            )}
+            approval={primary}
           />
+          {/* Item identity must not hide another independently answerable RPC. */}
+          {files.filter((approval) => approval !== primary).map((approval) => (
+            <ApprovalItem key={pendingRequestKey(approval)} approval={approval} />
+          ))}
           {inputCard}
         </>
       );
+    }
     case 'contextCompaction':
     case 'enteredReviewMode':
     case 'exitedReviewMode':
@@ -246,6 +251,11 @@ function ItemWithRequests({
   return assertNever(item);
 }
 
+/** Stable item markers survive regrouping and add no extent outside the measured turn row. */
+function ItemWithRequests(props: Parameters<typeof ItemBody>[0]) {
+  return <div data-transcript-item={props.item.itemId}><ItemBody {...props} /></div>;
+}
+
 export function TurnBlock({ entry }: Props) {
   const { t } = useTranslation();
   const userInputRequests = useTimelineStore((s) => s.userInputRequests);
@@ -256,18 +266,10 @@ export function TurnBlock({ entry }: Props) {
   const approvals = useTimelineStore(
     useShallow((s) =>
       Object.values(s.approvals).filter(
-        (approval) => approval.turnId === entry.turnId,
+        (approval) => approval.turnId === entry.turnId && approval.kind !== 'permissions' && approval.kind !== 'elicitation',
       ),
     ),
   );
-  // History opens in the cheap `summary` view, which withholds reasoning and
-  // plan items; a rendered turn fetches its own full items once.
-  useTurnItemsTopUp({
-    threadId: useTimelineStore((s) => s.threadId),
-    turnId: entry.turnId,
-    itemsView: entry.itemsView,
-    completed: entry.completed,
-  });
   // Render user-input requests whose itemId doesn't match any existing turn item.
   const itemIds = new Set(entry.items.map((item) => item.itemId));
   const unattachedInputs = Object.values(userInputRequests).filter(
@@ -384,13 +386,13 @@ export function TurnBlock({ entry }: Props) {
 
         {unattachedApprovals.map((approval) => (
           <ApprovalItem
-            key={String(approval.requestId)}
+            key={pendingRequestKey(approval)}
             approval={approval}
           />
         ))}
 
         {unattachedInputs.map((req) => (
-          <UserInputCard key={String(req.requestId)} request={req} />
+          <UserInputCard key={pendingRequestKey(req)} request={req} />
         ))}
 
         {entry.diff && <DiffViewer diff={entry.diff} />}

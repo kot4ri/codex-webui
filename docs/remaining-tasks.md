@@ -12,7 +12,12 @@
 - [x] Step 6: Item lifecycle（reasoning/agentMessage/mcpToolCall/commandExecution 流式渲染）
 - [x] Step 7: Thread 列表/切换/resume（侧边栏, 历史恢复）
 - [x] Step 8: FilesService 文件管理（后端 CRUD + delete + workspace root 安全 + chokidar 按需 watch + 前端文件树 breadcrumb + Monaco Editor + Diff 视图 + fileChange item + commandExecution 修复）
-- [x] Step 9: Web Terminal（node-pty + xterm.js + 全局/会话级终端 + UI 重构：sidebar 分区 + session 底部面板 + tab 切换）
+- [x] Step 9: Web Terminal（node-pty + xterm.js + 独立终端路由与会话平级 tabs + 稳定 attachment owner）
+
+- [x] 会话工作区 tabs 重构、独立文档/终端 owner、full 首屏 gate、submission/execution 分离及语义阅读锚定，见 [workspace-tabs.md](workspace-tabs.md)。
+- [x] 新增独立 Vitest browser project（Chromium/WebKit），现有 jsdom 测试保留。
+- [x] browser project 已在 Chromium + WebKit 实跑通过。**它当场否掉了两处推理**：跟随态只在 append/视口变化时贴底，导致每一次冷开都停在顶部（首屏是靠行把估算高度换成实测高度来收敛的，这既不改 count 也不改视口）；以及 `useFlushSync` 默认值与 `directDomUpdates` 冲突，每次修正都让 React 打印并丢弃一次 flush。两者都无法在 jsdom 里被发现。后续扩到终端 overlay 与 tab 外壳，共 34 项。
+- [x] **真实应用手动验证（Playwright 驱动）**，覆盖此前只有静态推演的那半边：冷开落底、打开文件树不再改变 transcript 高度、跨 tab 切换保住同一个滚动 DOM 节点、隐藏面板保留布局盒且 `inert`、两个终端平级且非活动者仍挂载附着、600px 断点、失败可见性。**它查出一个全部 404 个单测都拦不住的回归**：文件树门控写成「当前根 == 会话 cwd」，而双击进入子目录正是改变当前根的操作，于是首次进入任意子目录后整棵树连同工具栏被替换为永久 spinner。首轮修为「只等根存在」并补 4 个回归测试；二次审查补上独立的目录采用状态，避免冷切换期间显示上一会话的根，浏览路径仍不参与 cwd 比较。
 
 ## 待实现
 
@@ -22,7 +27,7 @@
 
 - [x] `codex.serverRequest` 事件转发 (ThreadsGateway)
 - [x] `codex.serverResponse` 客户端回传 (ThreadsGateway)
-- [x] `respondToServerRequest` 回写 app-server stdin (CodexJsonRpcClient)
+- [x] 由连接内 `ServerRequestOwner` 独占 server-request 答复 authority，持久化决定提交后才回写原 app-server stdin
 
 **前端**
 
@@ -62,7 +67,7 @@
 - [x] `PendingApprovalsModule`：SQLite `pending_server_requests` 表持久化 approval
 - [x] `PendingApprovalsService`：persist → emit、generation expire、multi-device CAS（`changes === 1`）
 - [x] `PendingApprovalsController`：`GET /api/pending-approvals`、`POST /api/pending-approvals/:requestId/respond`
-- [x] `ThreadsGateway`：serverRequest 先持久化再 emit、serverResponse 通过 CAS 服务响应
+- [x] ServerRequestOwner 在 ingress 接管并交 PendingApprovalsService 持久化；ThreadsGateway 只分发成功 admission，两个响应入口均用 instance-bound CAS
 
 **前端**
 
@@ -125,7 +130,7 @@
 - [x] ChatHeader：thread name 显示 + inline 编辑 + archived badge。
 - [x] thread/name/updated notification 同步 header title。
 - [x] `POST /api/threads/:threadId/turns/:turnId/steer` → `turn/steer`，支持进行中追问/追加输入。ChatInput Steer/Stop 按钮，activeTurnId 跟踪，approval 期间禁用 steer。
-- [x] app-server 重启后的 active thread 自动 `thread/resume` 与 snapshot 恢复。ActiveThreadRegistry ref-count + AutoResumeService lifecycle event + codex.lifecycle socket event + 前端 reconnect 重新订阅。
+- [x] app-server 重启后的 active thread 自动 `thread/resume` 与 snapshot 恢复。后端执行义务 inventory + AutoResumeService lifecycle event + codex.lifecycle socket event；room 成员资格不再决定恢复目标。
 
 ### 事件处理与 Normalize ✅ (P0 完成)
 
@@ -203,14 +208,19 @@
 
 ### Terminal 增强 ✅
 
+- [x] SQLite durable terminal identity、关闭资格撤销、restart/grace 替代仲裁；仅正在呈现的终端自动恢复，每 id 滚动 24 小时最多三次尝试，超限明确转手动。
+- [x] 会话 list + attach 发现现存 session（含 exited buffer），禁止发现创建进程；保留 tab 位置/标题，替换通知与上一 shell 输出分离，断线输入不重放。
+- [x] 实际 SQLite 迁移 / 文件数据库重开、真实 PTY close/grace/shutdown 终止和 Socket.IO 鉴权/丢失确认覆盖。
 - [x] 多 terminal tab/session 管理：context-based（`global` / `thread:<threadId>`），显示 cwd/shell/exitCode/attachedCount，tab create/close/rename/download。
-- [x] `DEFAULT_TERMINAL_CWD` 环境变量 + cwd 回退链（fail-fast if invalid）。
+- [x] 统一 cwd 选择与校验：会话目录必需且优先，全局显式目录优先，无显式目录才使用默认值；替换固定原启动目录，失败不回退。
 - [x] 终端 buffer 限制：前后端 xterm scrollback 统一配置（`WEBUI_TERMINAL_SCROLLBACK`，默认 5000）。
-- [x] Socket owner 校验：所有操作验证 terminal 存在 + context 匹配 + socket 已 attach，失败返回结构化错误。
+- [x] 终端网关显式鉴权，typed ACK 保留错误码；input/resize 校验 attachment + physical sessionId，logical close 无需先附着已丢失的 PTY。
 - [x] 断线重连恢复：`@xterm/headless` + `SerializeAddon` 服务端 VT 镜像，detach + grace period（`WEBUI_TERMINAL_GRACE_MS`，默认 45s），reconnect 返回完整序列化 VT 状态。
 - [x] 终端输出下载：后端从 headless buffer 导出 plain text，前端 blob 下载。
 - [x] 终端共享：同 context 多浏览器 tab 共享终端，输出广播，多 attach close 二次确认。
 - [x] Max terminal cap：全局上限 `WEBUI_TERMINAL_MAX_SESSIONS`（默认 10）。
+- [ ] **`terminal_identities` 的保留期需要一个运维答案。** 现在每个创建过的终端都永久留一行，刻意如此——已批准的行为覆盖"长断线后恢复"且没有给出时限，任何静默过期都会把契约悄悄改窄。代价是表和备份随使用时间单调增长。可安全回收的是**已关闭且不再持有物理资源**的行：未知身份本来就不可自动恢复，删掉它们不改变任何承诺。仍可恢复的行不能删。若将来引入清理，被忘记的 id 必须保持"不可自动恢复"，而不能退化成"未知即可新建"。
+- [ ] 替换提示目前常驻且不可关闭（按 `generation > 0` 判定）。需求要的是"不能被一闪而过的 toast 或会被输出冲掉的一行代替"，常驻是满足它最省事的做法，未必是唯一解——按物理 session 提供"本浏览器不再提示"是合理选项，但可关闭的范围属于产品决策。
 - ~~Docker/实机部署下的终端隔离等级提示~~ — 用户自行负责，不做。
 
 ### Multi-Thread 后续增强
@@ -261,9 +271,11 @@
 
 - [x] 触屏上的隐形控件：`opacity-0` 配 `group-hover:opacity-100` 的写法有 8 处，而 Tailwind v4 的 `hover:` / `group-hover:` 变体本身就编译在 `@media (hover: hover)` 内，触屏上那个 `opacity-0` 永远不会被抬起——控件不可见却仍可点中。改用 `@utility hover-reveal`（必须是 `@utility`：`index.css` 里未分层的 class 会压过整个 `@layer utilities`）。
 - [x] 移动端全高界面用视口单位：`100dvh` 不随 iOS 软键盘收缩（Safari 不实现 `interactive-widget`），部分内嵌浏览器的底部工具栏也不反映在任何视口测量里，输入框被压在下面。改为统一从 `--app-vh`（镜像 `visualViewport.height`）取高度，覆盖 `#root`、登录页、三个 integrations sheet 与移动端会话抽屉。同步跳过 `scale !== 1`，否则双指放大会把整个应用塌进放大区域。
-- [ ] 运行时控制台出现 `flushSync was called from inside a lifecycle method`（PR #20 验证移动端改动时观察到，与该 PR 的三项改动无关，未定位）。React 会放弃这次同步刷新改为异步提交，依赖同步布局读数的路径（虚拟列表测量、滚动定位）可能因此拿到过期几何。需找到调用点，优先怀疑在生命周期 / `useLayoutEffect` 内触发 store 更新的位置。
+- [x] 虚拟列表启用 `directDomUpdates` 并关闭 `useFlushSync`，避免 layout effect 测量时被 React 丢弃的同步 flush。直接 DOM 更新只覆盖已挂载节点的位置和 extent；大幅原生滚动中新进入范围的行仍需 React commit，不能据此宣称没有挂载延迟。`followOnAppend` 保持关闭，几何正确性须运行 browser project，见 [workspace-tabs.md](workspace-tabs.md)。
 
 ### UI 与交互增强
+
+- [ ] **无扩展名的纯文本文件被当作二进制**，走 hex dump 视图而不是编辑器。实测：`.gitconfig` 显示为 `MIME type: application/octet-stream` 加十六进制转储，`.zshrc` / `.npmrc` / `.profile` 等同理——恰好是用户最常想看的一类配置文件。分类发生在 `lib/file-category.ts`，只按扩展名判断，无扩展名即落到后端 metadata 的 MIME，而后端对不认识的内容返回 `application/octet-stream`。**非 tabs 重构引入，属既有行为**（该模块本轮未改动）。修的时候要当心：判据不能只看"是否可解码为 UTF-8"，否则真正的二进制文件会被塞进编辑器；可考虑按已知无扩展名配置文件名单 + 内容嗅探（NUL 字节/控制字符比例）联合判断，并保留用户显式切换到 hex 视图的入口。
 
 - [x] 可折叠工具调用：连续 2+ 个 MCP 工具调用合并为可展开/收起的分组；单个工具调用也可折叠参数/结果。完成后自动收起，`aria-expanded` 无障碍支持。
 - [x] TanStack Router 集成：code-based route tree，auth guard（beforeLoad + redirect search param），thread URL 化（`/t/$threadId`），SPA deep-link fallback（`fallthrough: true`）。
@@ -363,20 +375,49 @@
 - [x] 阻塞项逃生指引与后端行为一致（暂停 goal / 浏览器关会话都不解除预留），并渲染后端 `limitations`。
 - [x] Model picker 接入 includeHidden，移除前端二次过滤；生效中的隐藏模型恒常列出。
 - [ ] 真实多 agent 调度和 approval/user-input 暂停组合的集成覆盖。
-- [ ] 修复页错误状态与 raw/表单切换往返的组件级渲染测试。
-- [ ] auto-resume 父子顺序恢复目前为全串行；兄弟会话可并行，加载会话多时恢复偏慢。
+- [x] 修复页错误状态与 raw/表单切换往返的组件级渲染测试：覆盖真实 Query/SDK 回调、保存期间继续输入、跨浏览器冲突、TOML 编辑器挂载生命周期；修复查询失败被显示为无覆盖、标签关联和新增条目的实时模板重塑。
+- [x] auto-resume 并发测量完成，保留全串行：独立 home 的 32 会话四次对照未证明有实用且可重复的吞吐收益，提高并发明显增加单会话尾延迟；不引入 limiter。详见 [recovery-concurrency.md](recovery-concurrency.md)。
 
 ## Thread 策略与恢复
 
 - [x] 前后端两半均已落地（[契约](thread-policy-recovery.md)）。后端：安全设置观测值、按会话排队的变更、严格的载荷白名单、显式的 item 分页完整性、带权限字段的审批传输测试。前端：把 item 权威、turn 生命周期、历史覆盖范围三件事拆开；打开会话时按 turn 分组对账；open 与重连共用一个恢复协调器，且同时修复 turn 生命周期而不只修 item；审批内联进它所属的执行 item；per-thread 策略以观测顺序确认。**真实模型轮次的执行已实测**，不再是待验证项：会话在 `on-request`/只读下请求了审批，改为 `never`/完全访问后同一任务不再询问（`pnpm probe live-policy`）。
 - [x] 协议探针从一次性脚本升为纳入版本管理、受类型检查的代码（`codex_probe/`，见 [README](../codex_probe/README.md)）。方法与其参数由生成的 `ClientRequest` 在类型层相关联，拼错的调用在 spawn 前就失败；每次运行使用隔离的 CODEX_HOME；只用钉住的二进制。
 - [x] **策略观测值有了生命周期**。此前只在「从未观测过」时读一次，唯一刷新来源是 `thread/settings/updated`；断线期间由 CLI 或另一个客户端改的策略收不到通知，重连后无路径补读，徽章长期显示旧值且 Send 据此放行。现在打开完成（含重启恢复）及重连会补读策略，会话销毁或空闲驱逐时清掉观测值与确认计时器（`forgetPolicy` 此前在生产代码里从未被调用），`observed:false` 不再算作「已读过」因而不再永久卡在 unknown，仅最新发出的读取失败才会把已有证据标记为 `stale` 并在徽章上说明是「最后已知」而非当前生效。
-- [x] **open 响应不再用旧快照复活已结束的轮次**。响应是服务端处理请求那一刻的快照；若该轮次的 `turn/completed` 在请求在途期间已到达，旧实现会把指针重新点亮、composer 永远转圈。现在 open 路径与 `settleTurnLifecycleForThread` 采用同一条守卫：本地已终态的 turn 不被快照里的 running 状态复活。effort / serviceTier 的 seed 也不再无条件写入——observed 设置带上观测序号，手动打开、启动恢复及重启恢复都用请求发出前递增的基线打戳，期间到达的 `thread/settings/updated` 因而更新、不会被旧响应覆盖。
+- [x] **open 响应不再用旧快照复活已结束的轮次**。响应是服务端处理请求那一刻的快照；若该轮次的 `turn/completed` 在请求在途期间已到达，旧实现会把指针重新点亮、composer 永远转圈。现在 open 路径与 `settleTurnLifecycleForThread` 采用同一条守卫：本地已终态的 turn 不被快照里的 running 状态复活。effort 的 seed 受请求发出前的观测基线保护；serviceTier 是生命周期响应的本地 seed，测量表明 tier 不发变更通知，不再以无关通知清除该值。
 - [x] **plan 文本纳入 item 权威模型**。`planTextByItemId` 从 `Record<itemId, string>` 改为携带 `completed` 与 `observedSeq`，与 `TurnItemBase` 一致：终态之后到达的 delta 被拒绝（此前会追加出重复尾巴），持久快照按与 `selectPayload` 相同的规则让位于更新的终态观测。
 - [x] **重连恢复补齐两处缺口**。断线期间新开的轮次此前只恢复生命周期、不取内容，composer 显示在跑而该轮次渲染为空；现在被接管的活跃轮次先建立 turn 行，再一并取回 item 和提示词；即使读取头期间已有实时事件建立了行，也仍会补取缺失内容，同页普通旧历史不额外读取。审批只经 socket 送达，断线会同时丢掉两端：期间发起的不出现，期间在别的设备上被应答的不消失；现在重连按服务端的 pending 集合对账，启动路径与重连路径共用同一个 `syncPendingApprovals`。缺席仅解决请求发出前已有且未改变的 pending 卡片，已有决定不被旧快照重新打开；重叠读取按会话范围淘汰旧响应。
 - [x] **shell 轮次稳定性对照实测**（`pnpm probe turn-item-finality`）：0.153.2 上，同一 completed shell 轮次的完整 item 载荷在后续 shell 轮次和已加载线程的 `thread/resume` 后一致。比较完整载荷并要求成功读取和 resume，不再仅比较输出长度，也不外推为所有模型轮次永久不变。
-- [ ] **completed turn 永久缓存仍缺全面证据**：vendored README 的 `subAgentActivity` 条目描述了父轮次结束后追加 activity 的情况，shell 对照未覆盖；需实测模型/子代理迟到事件与 cold resume，再决定 item 查询缓存和重连失效策略。
-- [ ] **整个轮次在断线期间开始并结束时仍会遗漏**：恢复只接管活跃轮次；未知 completed 头不会生成转录，现有 older-history cursor 也到不了这段新历史。需要协调最近页刷新、转录合并及分页边界。
+- [x] **completed turn item 新鲜度**：三次真实子代理实测确认终态 turn 追加 activity；直接终止 pinned 原生进程后的 cold read/resume 保留追加项。查询失效、full turn 查询资格和应用资格一起更新；只立即刷新当前渲染历史，其他缓存按需刷新。详见 [completed-turn-items.md](completed-turn-items.md)。
+- [x] **断线期间完整错过的轮次**：恢复显式读取降序 summary 页，最多 10 页，锚点取读取发出前的 turn 集合。按页内身份与顺序合并，包括两个已知 turn 中间的缺口；无交集时采用最近窗口与真实 cursor，不伪造连续性。新增 live 边界、跨页缺口和删除后迟到读取回归。不再断言永久 append-only。
 - [x] **pending 同步的挂载生命周期**：从启动 effect 抽取后一度丢掉了原来的 `cancelled` 检查，登出或卸载后的迟到响应仍会写入 store。`syncPendingApprovals` 增加可选 `AbortSignal`，请求前与应用前各校验一次；启动路径传入 effect 自己的 abort controller。重叠读取的相互淘汰解决不了这件事——它表达的是「另一次读取更新」，不是「这个调用方已经不在了」。
 - [ ] **过期策略的显示与发送行为待确认**：当前 last-known 说明仅在策略弹层里，闭合徽章和 Send 不因 stale 单独改变；是否强化提示或阻止发送属于产品取舍。
 - [ ] 探针每次运行使用独立目录并显式指定子进程 cwd，避免并发运行互相清空；定义有界的传输失败与清理行为。
+- [ ] **崩溃 turn 的 `interrupted` 不是持久终态（已实测，原因未测）**：修正终止缺陷后重跑 `restart-recovery`，两个 active-goal 案例在 4 秒窗口后把崩溃 turn 读回 `inProgress`，且没有携带该 id 的 `turn/started`，goal 的新 turn 是另一个 id。只测到状态字段回退，**未测它是否真的在执行**。当前后端不受影响——该回退不经任何通知投递，resume 之后也不再轮询该 turn，`observeTurn` 的终态守卫因此从不触发；但若它确实在执行，执行盘点就漏了一条义务。需新探针回答"回退后的 turn 是否在做事"，再决定是否需要附着后的二次确认读。
+- [ ] **「打开会话收到的页与本地窗口无交集」缺乏证据，不据此改代码**（2026-09-11 实测，`pnpm exec ts-node --project codex_probe/tsconfig.json codex_probe/history-window.ts`）。`hydrateOpenedThread` 在无交集时让服务端视图整体胜出，一个人造 store fixture 能让它丢掉本地 turn；但**没有任何测量表明打开路径会产出那个输入**。139 次比对的最新页全部与观测到的 turn 序列一致（4/20/21/40 turn 的静止读、已加载与未加载两个进程、分页 resume、owner 退出后的读、冷 resume），无缺失或乱序，无持久化/投影失败诊断。两条曾被当作根因的推断也**被上游源码否掉**：`thread_turns_list_response_inner` 的分页分支**提前 return**，那句「Rollback and compaction events can change earlier turns」和 `loaded_thread.is_some()` 才合并活跃 turn 的逻辑**都属于 legacy 分支**；`project_rollout_line` 把 `RolloutItem::Compacted` 归入忽略臂，压缩只追加上下文替换记录，不裁剪分页转录。实测也否掉了后者：持有运行中 shell 时，未加载该会话的读进程同样返回该 turn 头（未完成的 **item** 不持久 ≠ **turn** 缺席）。**结论是有界的**：`NO_OMISSION_IN_MEASURED_READS`，不是「不可能发生」。仍未排除且需要真实证据才能继续的路径：显式 `thread/revert`（改写同一 thread 的保留前缀）、持久化/投影失败（源码支持存在，未注入）、以及本地只持有稀疏 live 片段时（例如迟到的子代理 activity 归属于最新 20 个之外的 turn）本就不共享锚点——后者替换是正确行为而非缺陷。要继续查需要实际收到的那一页与本地持有的 turn 身份，**不能再用自造的 disjoint fixture 论证**。
+- [ ] **open × recovery 的跨路径 epoch 漏洞**（机制已验证，独立于上一条）：`invalidateThreadEpoch` 推进 thread + recovery 两个 epoch，`supersedeRecovery` 只推进 recovery。于是「open A 记下 thread epoch E → recovery B 装上更新窗口 → A 的旧响应回来时 thread epoch 仍是 E、检查通过」成立，旧响应可以覆盖 cursor 与 turn 生命周期。当前没有已知的有害输入（见上一条），但所有能建立最新历史窗口的操作本应共用同一套 supersession，`thread-view.tsx` 的归档回退路径同样只按会话身份校验而没有请求代次保护。
+- [x] **全部既有探针已在修正后的 harness 上重跑复核**（12 个，含花钱的）。结论：终止缺陷只波及真正依赖"崩溃"语义的测量，即 `restart-recovery`（两条复现、一条被推翻，见上）；其余探针只用 `close()` 走 SIGTERM，而 SIGTERM 一直被 wrapper 正常转发，因此结论不受影响。harness 的大改也**未引入回归**：`settings-update`、`item-persistence`、`item-ordering`、`turn-item-finality`、`server-request-identity`、`observable-service-tier`、`live-policy`、`file-approval-context`、`metadata-filters`、`metadata-incremental` 十条全部复现原结论。两个例外都不是回归——`server-request-disposition` 的 fixture 未被触发（模型改用文件编辑工具而非 shell），探针如实报告「this run measured nothing」并以非零码退出；`auth-token-refresh` 的核心比较成立且差距更大（拒绝 34.8s vs 静默撞上 180s 上限仍未结束），但它先前附带的「静默最终会结束」这次**未复现**，静默的收敛时间不可依赖。
+
+## 后端发现与恢复的重构
+
+- [x] 共享的内存元数据读模型：完整发布、显式新鲜度、后端自有的外部变更发现；折叠先于分页的既有约束不变。
+- [x] 面向已认证连接的全局失效信号（overview / pending），覆盖已提交的取消与过期。
+- [x] 后端全局 attention：显式区分 human/machine 请求；完整文件变更集合在首次发布前关联，live 与 REST 均携带 reviewSubject；全局退休覆盖 CAS、取消和过期；删除范围内的 pending 读取返回 409 而非伪造缺席，无 DB 迁移。
+- [x] 原生 command/writeStdin/file approval 与 user-input 的全局 attention：live/REST 共享幂等摄入与通知，generation 配对退休保留本地决定；完整主体严格校验，inline/standalone 均使用请求主体并在缺失时只给 Decline/Cancel；删除读取 409 保持原状态。
+- [x] 以执行义务而非 socket 成员资格作为重启恢复依据：进行中/被阻塞的 turn、活跃 goal、父会话先于子会话重新附着；所有浏览器断开后依然恢复；不重放任何提交。
+- [x] 钉住版本的元数据探针：字面量 name/preview 搜索、相对 cwd、排序、外部变更发现，以及「列出的父会话缺失」这一上游限制。
+- [x] 增量元数据的审查修复：实时 patch 跨分页存活、归档迁移使被跨越的走查作废、pending-listing 的紧急性收窄到单个会话且无后续 turn 也会过期、走查期间抬起的陈旧标记跨发布存活。
+- [x] 修正增量探针的秒级时间戳误差：拉开间隔后，即使是被拒绝的 turn 也会推进 `updatedAt`；排序保持显式陈旧直到周期发现。
+- [x] 侧边栏行索引只由**正在渲染**的视图构成。被 gate 的查询仍保留缓存，索引全部三个视图会让陈旧的详情页盖掉新鲜的首页行——连 `openThreadId` 与成员集合一起盖掉，而这两者决定点击行为。逻辑抽到 `web/src/lib/sidebar-rows.ts` 并有回归测试。
+- [x] 排序时效滞后确认为**有意取舍**（2026-09-10 裁决）。恢复即时排序需要在 turn 结束时对单个会话做针对性元数据读，且需先探针确认投递时上游 `updatedAt` 是否已推进。见 [conversation-recovery.md](conversation-recovery.md)。
+- [x] 崩溃/重新附着的原生行为探针（`codex_probe/restart-recovery.ts`）：崩溃发生在 turn 进行中，实测重新附着能恢复什么、不能恢复什么。
+- [x] 未关联的执行活动保持保守：只有相关的终态证据或关闭/删除才退休它；不得用无关的历史完成事件去剪枝。已有实现及 `thread-execution-inventory.service.spec.ts` 回归测试覆盖。
+- [x] 前端刷新与按需订阅：overview 全局信号共用有界延迟失效，覆盖会话与分支查询；pending 共用可取消、含尾随读取的全局对账。页面加载由路由 opener 负责，重启只恢复正在看的转录，重连只读不 resume；三者共享历史/item/policy/auxiliary 修复。原 open applier 已有 policy 读取，现移除 wrapper 重复读取。选择与路由退出真正离开旧房间，订阅确认后补读连接前窗口；无启动期批量订阅。
+- [x] 重新生成前端 SDK 以覆盖 overview 新增的 `freshness` 字段，以及 pending 的 `reviewSubject` / `generation` 与 `{generation, requests}` 响应。
+- [ ] 归档范围契约：workspace 过滤后的 `memberThreadIds` 不包含其它工作区成员，后端却归档完整已知树；跨工作区成员的前端清理/离开当前会话仍需权威的归档范围或逐线程事件对齐，不能从未显示的旧缓存推断。
+- [ ] 用真实模型的 turn、goal 与受控子会话验证崩溃/重新附着结果；重新附着本身不承诺执行续跑。
+- [x] 二次交叉审查：归档完成使用请求发出时的成员集合，避免视图切换/刷新后遗漏隐藏分支；四组独立冷恢复探针区分 null 与实际分页、读取附着前 goal、验证模型请求确实已挂起；旧 turn 终态不删除新 goal 续跑 turn。
+- [ ] **策略变更需另行产品裁决**：活跃 goal 冷恢复后可由原生调度器开启新 turn，与已批准的活跃 goal 恢复保持一致。当前不改恢复策略、不加开关；如果要禁止无人值守续跑，需先确认产品语义与原生能力，不能假定已有"仅附着不执行"模式。
+- [x] **Server request totality 与外部 token refresh**：每个已导出 method 在 ingress 穷尽分流，未知运行时 method 明确错误答复；外部 ChatGPT token 无 refresh 凭据，立即拒绝并提示重新登录。实测该方法会按约 10 秒超时重试，不再描述为无限等待。登录/API key/token 的本地 wire audit 投影先行脱敏，不改实际 payload。
+- [x] **审批响应身份契约**：随机 instanceId 贯穿数据库、live、pending 读取、两个响应 API 与退休。拒绝缺失身份，重复 admission 不覆写 proposal；CAS 先提交 submitted，再写原连接，原生通知确认 resolved。模糊传输失败不重开 pending、不重试。已覆盖终态先于 HTTP 的本地决定归因、instance tombstone 消费、Nest 主体捕获顺序、竞争 SQLite writer 与连接退出路径；失败恢复在 SQL 中限取当前数值 generation 和请求范围的最新 20 条（完整 backend 重启后 generation 复用的提示限制见 approval.md）。
+- [x] **其余人机请求的浏览器交互**：权限完整显示及选择编码；MCP primitive form/URL 与 nullable turn；未知扩展语义只提供 Decline/Cancel。两种 legacy approval 明确拒绝。客户端失败说明与上游 turn outcome 分开保留。
+- [x] **service tier 本地诚实显示**：测量证明不存在可用被动读，tier 变更也没有通知；不引入跨客户端同步或用于刷新显示的 resume。采用参考客户端的生命周期 seed 与模型支持过滤，unsupported 配置不冒充 Standard，并显示上游 warning。

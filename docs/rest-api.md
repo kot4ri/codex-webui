@@ -199,7 +199,7 @@ Apps UI 的列表行保持紧凑，只保留启用状态和管理入口。Defaul
 | ------------------------------------- | ------------------------------------------------------------- |
 | POST /threads                         | `thread/start`                                                |
 | GET /threads                          | `thread/list`                                                 |
-| GET /threads/overview                 | `thread/list` plus local/adopted topology projection          |
+| GET /threads/overview                 | Shared in-memory metadata plus local/adopted topology projection; explicit `freshness` |
 | GET /threads/collaboration-modes      | `collaborationMode/list`                                      |
 | GET /threads/:id                      | `thread/read` with metadata only                              |
 | GET /threads/:id/collaboration-mode   | local observed settings cache                                 |
@@ -254,3 +254,30 @@ Apps UI 的列表行保持紧凑，只保留启用状态和管理入口。Defaul
 ## Policy and recovery guarantees
 
 See [thread-policy-recovery.md](thread-policy-recovery.md) for queued-versus-observed policy semantics, settings freshness, explicit paging completeness, measured item durability/order, and approval payload preservation.
+
+## Shared conversation metadata
+
+`GET /api/threads/overview` reads a backend-owned collection instead of enumerating
+upstream threads per request. It preserves collapse-before-pagination and adds
+`freshness: { generation, refreshedAt, stale, refreshing }`; `refreshedAt` is Unix
+milliseconds. No usable collection returns HTTP 503. See
+[conversation-recovery.md](conversation-recovery.md) for scheduling, failure behavior,
+filter measurements, and the global socket invalidation contract.
+
+## Pending human interactions
+
+`GET /api/pending-approvals` (optional comma-separated `threadIds`) returns
+`{ generation, requests, failures }`. Requests include both pending and locally submitted decisions. Every row carries its immutable `instanceId`, backend-validated `presentation`, `negativeOnlyReason`, and
+`reviewSubject`: the full `{ type: 'fileChange', changes }` for a native file
+approval, or null when the upstream request parameters already carry the subject.
+Every file change retains `path`, `diff` and the structured `kind` union, including
+`move_path` for update/rename proposals. Live delivery carries the identical subject.
+
+A scope intersecting a deletion guard returns HTTP 409 with error code
+`threads.delete_in_progress`; it returns no partial snapshot. The browser must
+preserve held requests and retry after the global pending-change hint on release.
+Internal deletion planning is unaffected. `POST /api/pending-approvals/:requestId/respond`
+requires `{ instanceId, result, clientId? }`; missing identities are rejected. First-writer-wins CAS commits `submitted` before transmission on the original connection. Server retirement confirms resolution separately; uncertain delivery does not reopen the decision. A file approval whose `reviewSubject` is null accepts only `decline` or
+`cancel`; anything else returns HTTP 409 `approvals.subject_unavailable` and
+leaves the request pending, so no client can approve changes it could not show. See [approval.md](approval.md#global-attention-contract) for the complete
+REST/socket contract, including immutable instance identity, method-specific encoding and neutral retirement. Failure replay is limited in SQLite to the twenty most recent explanations within the requested scope and current numeric generation. This generation filter can match older backend lifetimes after the counter resets; it is not response authority.

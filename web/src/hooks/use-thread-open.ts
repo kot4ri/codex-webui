@@ -10,8 +10,10 @@
  *
  * There is exactly one owner now: the route. Every other surface navigates.
  */
+import { HISTORY_PAGE_SIZE } from '@/lib/history-prefetch';
 import { useCallback } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { invalidateThreadDetails } from '@/lib/query-invalidation';
 import { useTranslation } from 'react-i18next';
 import { threadsResumeThreadMutation } from '@/generated/api/@tanstack/react-query.gen';
 import {
@@ -25,15 +27,27 @@ import type {
   ThreadReadResponseDto,
   ThreadTurnsPageDto,
 } from '@/generated/api/types.gen';
-import { recoverTurnItems } from '@/lib/thread-recovery';
+import { recoverThreadAfterReconnect } from '@/lib/thread-recovery';
+import {
+  currentRecoveryEpoch,
+  currentThreadEpoch,
+  invalidateThreadEpoch,
+} from '@/lib/thread-recovery-epoch';
+import i18n from '@/i18n';
+import { assertFullHistoryPage } from '@/lib/full-history';
+import { restoreHistoryBookmark } from '@/lib/restore-history-bookmark';
+import { getApiErrorMessage } from '@/lib/api-error';
 import { useModelStore, type ReasoningEffort } from '@/stores/model-store';
 import { showSnackbar } from '@/stores/snackbar-store';
 import { useTimelineStore } from '@/stores/timeline-store';
 import { nextObservationSeq } from '@/lib/turn-item-merge';
-import { refreshThreadPolicy, settleIfObserved } from '@/stores/thread-policy-store';
+import {
+  refreshThreadPolicy,
+  settleIfObserved,
+} from '@/stores/thread-policy-store';
 
 /** Turns fetched per older-history page. */
-export const HISTORY_PAGE_SIZE = 20;
+export { HISTORY_PAGE_SIZE } from '@/lib/history-prefetch';
 
 /** Extracts a display label from a thread DTO. */
 function threadLabel(thread: {
@@ -49,17 +63,40 @@ function threadLabel(thread: {
  * Kept off the open path's critical section: none of them is needed to paint
  * the conversation, and a failure in any one must not stop the other two.
  */
-function hydrateAuxiliaryData(threadId: string): void {
+export async function hydrateAuxiliaryData(threadId: string): Promise<void> {
   const store = useTimelineStore.getState();
-  void tokenUsageReadThreadTokenUsage({ path: { threadId } })
-    .then(({ data }) => data && store.hydrateTokenUsageForThread(threadId, data.turns))
-    .catch(() => undefined);
-  void turnDiffReadThreadTurnDiffs({ path: { threadId } })
-    .then(({ data }) => data && store.hydrateTurnDiffsForThread(threadId, data.turns))
-    .catch(() => undefined);
-  void turnErrorsReadThreadTurnErrors({ path: { threadId } })
-    .then(({ data }) => data && store.hydrateTurnErrorsForThread(threadId, data.errors))
-    .catch(() => undefined);
+  const baseline = store.getThreadRuntime(threadId);
+  if (!baseline) return;
+  const epoch = currentRecoveryEpoch(threadId);
+  const current = () =>
+    currentRecoveryEpoch(threadId) === epoch &&
+    Boolean(store.getThreadRuntime(threadId));
+  await Promise.all([
+    tokenUsageReadThreadTokenUsage({ path: { threadId } })
+      .then(
+        ({ data }) =>
+          data &&
+          current() &&
+          store.hydrateTokenUsageForThread(threadId, data.turns, baseline),
+      )
+      .catch(() => undefined),
+    turnDiffReadThreadTurnDiffs({ path: { threadId } })
+      .then(
+        ({ data }) =>
+          data &&
+          current() &&
+          store.hydrateTurnDiffsForThread(threadId, data.turns, baseline),
+      )
+      .catch(() => undefined),
+    turnErrorsReadThreadTurnErrors({ path: { threadId } })
+      .then(
+        ({ data }) =>
+          data &&
+          current() &&
+          store.hydrateTurnErrorsForThread(threadId, data.errors),
+      )
+      .catch(() => undefined),
+  ]);
 }
 
 /**
@@ -69,14 +106,16 @@ function hydrateAuxiliaryData(threadId: string): void {
  * rebuilding the complete transcript server-side. The returned cursor keeps
  * earlier history behind the existing explicit load-earlier affordance.
  */
-export function applyReadOnlySnapshot(
+export async function applyReadOnlySnapshot(
   response: ThreadReadResponseDto,
   initialTurnsPage: ThreadTurnsPageDto,
-): void {
+): Promise<void> {
+  assertFullHistoryPage(initialTurnsPage);
   const store = useTimelineStore.getState();
   const threadId = response.thread.id;
   if (!store.getThreadRuntime(threadId)) return;
 
+  const epoch = currentThreadEpoch(threadId);
   store.setReadOnlyThread(response.thread);
   // The failed open already created this runtime without a label, and
   // `ensureThreadState` will not relabel an existing one — so the title has to
@@ -90,7 +129,13 @@ export function applyReadOnlySnapshot(
     cwd: response.thread.cwd,
   });
   store.setThreadStatusForThread(threadId, response.thread.status);
-  hydrateAuxiliaryData(threadId);
+  store.setOpenStateForThread(threadId, {
+    openState: 'opening', historyRequest: 'loading', historyError: null,
+  });
+  void hydrateAuxiliaryData(threadId);
+  await restoreHistoryBookmark(threadId);
+  if (epoch !== currentThreadEpoch(threadId) || !store.getThreadRuntime(threadId)) return;
+  store.setOpenStateForThread(threadId, { openState: 'ready', historyRequest: 'idle' });
 }
 
 /**
@@ -98,13 +143,20 @@ export function applyReadOnlySnapshot(
  *
  * Exported because opening is not only user-initiated: reconnecting and
  * recovering after a refresh reopen threads in the background. They must
- * interpret the response the same way, or `thread.turns` — empty by design
- * since history became metadata-first — silently renders those threads blank.
+ * interpret the response the same way, or the metadata-only `thread.turns`
+ * field silently renders those threads blank.
+ *
+ * @param response - Metadata and the initial full page from the backend
+ * @param baselineSeq - Observation sequence captured before requesting the open
+ * @param joined - Optional room acknowledgement; triggers a fresh post-join page
+ * @returns Completion of repair reads; initial rendering happens synchronously
  */
 export function applyOpenResponse(
   response: ThreadOpenResponseDto,
   baselineSeq: number = -1,
-): void {
+  joined?: Promise<boolean>,
+): Promise<void> {
+  assertFullHistoryPage(response.initialTurnsPage);
   const store = useTimelineStore.getState();
   const threadId = response.thread.id;
 
@@ -114,7 +166,7 @@ export function applyOpenResponse(
   // this was in flight. Applying anyway would recreate it — the store writes
   // through a create-if-absent helper — and put a deleted conversation back on
   // screen with content.
-  if (!store.getThreadRuntime(threadId)) return;
+  if (!store.getThreadRuntime(threadId)) return Promise.resolve();
 
   store.setThreadTitleForThread(threadId, threadLabel(response.thread));
   store.hydrateOpenedThread({
@@ -130,7 +182,9 @@ export function applyOpenResponse(
   store.setThreadStatusForThread(threadId, response.thread.status);
   // The first hook read can precede resume and report observed:false. Opening
   // (including restart recovery) is the point at which settings are available.
-  void refreshThreadPolicy(threadId).then(() => settleIfObserved(threadId));
+  const policy = refreshThreadPolicy(threadId).then(() =>
+    settleIfObserved(threadId),
+  );
 
   // Seed the composer's display-only view of this thread's resolved settings.
   // `thread/settings/updated` only fires when settings change, so without this
@@ -183,20 +237,47 @@ export function applyOpenResponse(
   } else if (known === null || pageCoversKnownTurn) {
     store.setActiveTurnIdForThread(threadId, null);
   }
-  store.setLoadingForThread(
-    threadId,
-    Boolean(activeTurn) || (known !== null && !pageCoversKnownTurn),
+
+  // A room acknowledgement closes the HTTP/socket opening gap. Read full
+  // history after it and reconcile live observations before the cold reveal.
+  const epoch = currentThreadEpoch(threadId);
+  const repair = (joined ?? Promise.resolve(false)).then(
+    async (acknowledged) => {
+      if (
+        epoch !== currentThreadEpoch(threadId) ||
+        !store.getThreadRuntime(threadId)
+      )
+        return;
+      // HTTP and Socket.IO are independent. An acknowledged join needs a fresh
+      // page after it; an HTTP-only open can still repair its returned page.
+      const complete = await recoverThreadAfterReconnect(
+        threadId,
+        acknowledged ? undefined : response.initialTurnsPage,
+        baselineSeq,
+      );
+      if (!complete && epoch === currentThreadEpoch(threadId))
+        throw new Error(
+          store.getThreadRuntime(threadId)?.historyError ??
+            i18n.t(
+              'Conversation recovery did not finish. Retry loading history.',
+            ),
+        );
+      if (epoch === currentThreadEpoch(threadId))
+        await hydrateAuxiliaryData(threadId);
+    },
   );
-
-  // A running turn arrives empty: the page is fetched in the `summary` view,
-  // which carries only user messages and a turn's final assistant message, and
-  // a turn still running has no final message yet. Its finished items are
-  // durable all the same — persistence happens per item, not per turn — so
-  // they are read separately instead of leaving the transcript blank until the
-  // turn ends. The per-turn top-up cannot do this: it is gated on completion.
-  if (activeTurn) void recoverTurnItems(threadId, activeTurn.id);
-
-  hydrateAuxiliaryData(threadId);
+  return Promise.all([repair, policy]).then(async () => {
+    await restoreHistoryBookmark(threadId);
+    if (
+      epoch !== currentThreadEpoch(threadId) ||
+      !store.getThreadRuntime(threadId)
+    )
+      return;
+    store.setOpenStateForThread(threadId, {
+      openState: 'ready',
+      historyRequest: 'idle',
+    });
+  });
 }
 
 /**
@@ -208,6 +289,7 @@ export function applyOpenResponse(
  * switching conversations feel broken.
  */
 export function useOpenThread() {
+  const queryClient = useQueryClient();
   const { t } = useTranslation();
 
   return useMutation({
@@ -215,30 +297,55 @@ export function useOpenThread() {
     onMutate: (variables) => {
       const threadId = variables.path.threadId;
       const store = useTimelineStore.getState();
-      store.setActiveThread(threadId);
+      invalidateThreadEpoch(threadId);
+      const joined = store.setActiveThread(threadId);
+      store.setHistoryLoadingForThread(threadId, false);
       const runtime = store.getThreadRuntime(threadId);
-      if (!runtime?.hydrated) store.setLoadingForThread(threadId, true);
+      store.setOpenStateForThread(threadId, {
+        openState: runtime?.openState === 'ready' ? 'ready' : 'opening',
+        historyRequest: 'loading',
+        historyError: null,
+      });
       // Captured before the request goes out, so anything observed while it is
       // in flight outranks the snapshot the response carries.
-      return { baselineSeq: nextObservationSeq() };
+      return {
+        baselineSeq: nextObservationSeq(),
+        epoch: currentThreadEpoch(threadId),
+        joined,
+      };
     },
     onSuccess: (response: ThreadOpenResponseDto, _variables, context) => {
-      applyOpenResponse(response, context?.baselineSeq);
+      if (context?.epoch !== currentThreadEpoch(response.thread.id)) return;
+      const repair = applyOpenResponse(
+        response,
+        context?.baselineSeq,
+        context.joined,
+      );
+      invalidateThreadDetails(queryClient, response.thread.id);
       if (response.mode === 'readOnly') {
         showSnackbar(
           t('This conversation is open in another client; opened read-only.'),
           'warning',
         );
       }
+      return repair;
     },
-    onError: (_err, variables) => {
+    onError: (error, variables, context) => {
       // Same guard as the success path, for the same reason: the store's
       // setters create a runtime when one is absent, so clearing the loading
       // flag on a thread that was deleted mid-request would rebuild the shell
       // of a conversation that no longer exists.
       const store = useTimelineStore.getState();
-      if (store.getThreadRuntime(variables.path.threadId)) {
-        store.setLoadingForThread(variables.path.threadId, false);
+      if (
+        context?.epoch === currentThreadEpoch(variables.path.threadId) &&
+        store.getThreadRuntime(variables.path.threadId)
+      ) {
+        const runtime = store.getThreadRuntime(variables.path.threadId);
+        store.setOpenStateForThread(variables.path.threadId, {
+          openState: runtime?.openState === 'ready' ? 'ready' : 'error',
+          historyRequest: 'error',
+          historyError: getApiErrorMessage(error),
+        });
       }
     },
   });
@@ -257,6 +364,10 @@ export function useLoadOlderHistory(threadId: string | null) {
     const runtime = store.getThreadRuntime(threadId);
     if (!runtime?.historyCursor || runtime.historyLoading) return;
 
+    const epoch = currentRecoveryEpoch(threadId);
+    const current = () =>
+      currentRecoveryEpoch(threadId) === epoch &&
+      Boolean(store.getThreadRuntime(threadId));
     store.setHistoryLoadingForThread(threadId, true);
     try {
       const { data } = await threadsListTurns({
@@ -268,15 +379,22 @@ export function useLoadOlderHistory(threadId: string | null) {
           itemsView: 'full',
         },
       });
+      if (!current()) return;
       if (!data) {
         store.setHistoryLoadingForThread(threadId, false);
         return;
       }
+      assertFullHistoryPage(data);
       store.prependHistoryForThread(threadId, data.data, data.nextCursor);
-    } catch {
+    } catch (error) {
+      if (current())
+        store.setOpenStateForThread(threadId, {
+          historyRequest: 'error',
+          historyError: getApiErrorMessage(error),
+        });
       // Leaving the cursor untouched keeps the control available for a retry;
       // clearing it would silently declare the history complete.
-      store.setHistoryLoadingForThread(threadId, false);
+      if (current()) store.setHistoryLoadingForThread(threadId, false);
     }
   }, [threadId]);
 }

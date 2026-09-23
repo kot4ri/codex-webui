@@ -21,8 +21,6 @@ import {
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
-import { pendingApprovalsRespond } from '@/generated/api/sdk.gen';
-import { useTimelineStore } from '@/stores/timeline-store';
 import type {
   ApprovalRequest,
   RawCommandDecision,
@@ -30,16 +28,15 @@ import type {
   ResolvableApprovalDecision,
 } from '@/types/approval';
 import { cn } from '@/lib/utils';
+import { useApprovalDecision } from '@/hooks/use-approval-decision';
 
-/** Maps UI decision to Codex JSON-RPC decision value. */
-function toRpcDecision(decision: ResolvableApprovalDecision): string {
-  switch (decision) {
-    case 'accepted': return 'accept';
-    case 'acceptedForSession': return 'acceptForSession';
-    case 'declined': return 'decline';
-    case 'cancelled': return 'cancel';
-  }
-}
+/** Natural-language keys for the choice this browser submitted. */
+const DECISION_LABELS: Record<ResolvableApprovalDecision, string> = {
+  accepted: 'Accepted',
+  acceptedForSession: 'Accepted for session',
+  declined: 'Declined',
+  cancelled: 'Cancelled',
+};
 
 function hasSimpleDecision(
   decisions: RawCommandDecision[] | null | undefined,
@@ -53,59 +50,6 @@ function hasAmendment(
   key: string,
 ): boolean {
   return decisions?.some((d) => typeof d === 'object' && key in d) ?? false;
-}
-
-/**
- * Sends decisions for one approval request.
- *
- * The thread and request identity are captured here rather than read at
- * completion time: answering can outlive the conversation staying selected, and
- * resolving against whichever thread happens to be on screen later would mark
- * the wrong card answered.
- */
-function useApprovalDecision(approval: ApprovalRequest) {
-  const resolveApprovalForThread = useTimelineStore(
-    (s) => s.resolveApprovalForThread,
-  );
-  const { threadId, requestId } = approval;
-
-  const send = (body: { result: { decision: unknown } }, settled: ResolvableApprovalDecision) => {
-    // `throwOnError` is required, not decorative. The generated client resolves
-    // with `{ data, error }` by default and the app's error interceptor returns
-    // the error rather than throwing it, so a rejected write — a 409 from
-    // another device answering first, a 503 while the app-server restarts —
-    // reached `.then` and marked the card Accepted while the server had done
-    // nothing of the sort. A request whose response failed stays unresolved
-    // until authoritative evidence arrives.
-    void pendingApprovalsRespond({
-      path: { requestId: String(requestId) },
-      body: body as never,
-      throwOnError: true,
-    })
-      .then(() => resolveApprovalForThread(threadId, requestId, settled))
-      .catch(() => undefined);
-  };
-
-  return {
-    decide: (decision: ResolvableApprovalDecision) =>
-      send({ result: { decision: toRpcDecision(decision) } }, decision),
-    acceptWithExecPolicy: () => {
-      const patterns = approval.proposedExecpolicyAmendment;
-      if (!patterns?.length) return;
-      send(
-        { result: { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: patterns } } } },
-        'accepted',
-      );
-    },
-    applyNetworkAmendment: (index: number) => {
-      const amendment = approval.proposedNetworkPolicyAmendments?.[index];
-      if (!amendment) return;
-      send(
-        { result: { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: amendment } } } },
-        'accepted',
-      );
-    },
-  };
 }
 
 /**
@@ -149,6 +93,7 @@ export function ApprovalDetails({ approval }: { approval: ApprovalRequest }) {
 
   return (
     <>
+      {approval.negativeOnlyReason && <p role="alert" className="text-xs text-amber-600">{t(approval.negativeOnlyReason)}</p>}
       {approval.reason && (
         <p className="text-xs text-muted-foreground">{approval.reason}</p>
       )}
@@ -214,7 +159,7 @@ export function ApprovalDetails({ approval }: { approval: ApprovalRequest }) {
 export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
   const { t } = useTranslation();
   const [amendmentsOpen, setAmendmentsOpen] = useState(false);
-  const { decide, acceptWithExecPolicy, applyNetworkAmendment } =
+  const { decide, acceptWithExecPolicy, applyNetworkAmendment, submitting } =
     useApprovalDecision(approval);
 
   if (approval.status !== 'pending') return null;
@@ -223,14 +168,27 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
   // `availableDecisions` is optional. Without it, expose only accept/decline;
   // session-level decisions and amendments require explicit server permission.
   const explicit = Array.isArray(avail);
-  const showAccept = !explicit || hasSimpleDecision(avail, 'accept');
-  const showAcceptForSession = hasSimpleDecision(avail, 'acceptForSession');
-  const showDecline = !explicit || hasSimpleDecision(avail, 'decline');
-  const showCancel = hasSimpleDecision(avail, 'cancel');
+  // A file approval whose change set could not be retained is answerable but
+  // not approvable. The backend refuses anything but decline/cancel with a 409,
+  // so offering Accept here would only produce a button that always fails —
+  // and, worse, one that reads as though approving unseen writes were allowed.
+  const canApprove = !approval.negativeOnlyReason && !(
+    approval.kind === 'fileChange' && !approval.reviewChanges?.length
+  );
+  const showAccept = canApprove && (!explicit || hasSimpleDecision(avail, 'accept'));
+  const showAcceptForSession =
+    canApprove && hasSimpleDecision(avail, 'acceptForSession');
+  const showDecline = !canApprove || !explicit || hasSimpleDecision(avail, 'decline');
+  // Cancel is normally opt-in, but with no subject it is the other half of the
+  // only answer left; without it a request the server permits only to cancel
+  // could have no button at all.
+  const showCancel = hasSimpleDecision(avail, 'cancel') || !canApprove;
   const showExec =
+    canApprove &&
     hasAmendment(avail, 'acceptWithExecpolicyAmendment') &&
     Boolean(approval.proposedExecpolicyAmendment?.length);
   const showNetwork =
+    canApprove &&
     hasAmendment(avail, 'applyNetworkPolicyAmendment') &&
     Boolean(approval.proposedNetworkPolicyAmendments?.length);
 
@@ -239,6 +197,7 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
       <div className="flex flex-wrap gap-2">
         {showAccept && (
           <Button
+            disabled={submitting}
             size="sm"
             variant="outline"
             className="h-7 border-green-500/50 text-green-500 hover:bg-green-500/10"
@@ -250,6 +209,7 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
         )}
         {showAcceptForSession && (
           <Button
+            disabled={submitting}
             size="sm"
             variant="outline"
             className="h-7 border-green-500/30 text-green-600 hover:bg-green-500/10"
@@ -261,6 +221,7 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
         )}
         {showDecline && (
           <Button
+            disabled={submitting}
             size="sm"
             variant="outline"
             className="h-7 border-red-500/50 text-red-500 hover:bg-red-500/10"
@@ -272,6 +233,7 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
         )}
         {showCancel && (
           <Button
+            disabled={submitting}
             size="sm"
             variant="outline"
             className="h-7 border-orange-500/50 text-orange-500 hover:bg-orange-500/10"
@@ -319,6 +281,7 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
                     </code>
                   ))}
                   <Button
+                    disabled={submitting}
                     size="sm"
                     variant="outline"
                     className="h-6 border-green-500/30 text-xs text-green-600 hover:bg-green-500/10"
@@ -342,6 +305,7 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
                         {amendment.action === 'allow' ? '✓' : '✗'} {amendment.host}
                       </code>
                       <Button
+                        disabled={submitting}
                         size="sm"
                         variant="outline"
                         className="h-6 px-2 text-xs"
@@ -366,11 +330,27 @@ export function ApprovalControls({ approval }: { approval: ApprovalRequest }) {
  *
  * `resolved` stays deliberately neutral: app-server also resolves requests
  * during lifecycle cleanup on turn start, completion and interrupt, so it does
- * not mean the user accepted anything.
+ * not mean the user accepted anything. `approval.decision` is the separate,
+ * certain half — what this browser submitted — so an answered card still says
+ * which choice was made without claiming the action was carried out.
  */
 export function ApprovalStatusBadge({ approval }: { approval: ApprovalRequest }) {
   const { t } = useTranslation();
+  const submitting = approval.status === 'submitted';
+  const failed = approval.status === 'failed';
+  if (approval.decision && (submitting || failed || approval.status === 'resolved'))
+    return (
+      <span className={cn('flex items-center gap-1 text-xs', failed ? 'text-destructive' : 'text-muted-foreground')}>
+        {t(DECISION_LABELS[approval.decision])}
+        {submitting && ` · ${t('Decision submitted')}`}
+        {failed && ` · ${t('Delivery unconfirmed')}`}
+      </span>
+    );
   switch (approval.status) {
+    case 'submitted':
+      return <span className="text-xs text-muted-foreground">{t('Decision submitted')}</span>;
+    case 'failed':
+      return <span className="text-xs text-destructive">{t('Delivery unconfirmed')}</span>;
     case 'accepted':
       return (
         <span className="flex items-center gap-1 text-xs text-green-500">

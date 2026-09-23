@@ -1,14 +1,18 @@
 /** Types for Codex approval workflow (server-initiated requests). */
+import type { FileChangeEntry } from '@/types/timeline';
+import type { InteractionPresentationDto } from '@/generated/api';
 
 export type ApprovalDecision =
   | 'accepted'
   | 'acceptedForSession'
   | 'declined'
   | 'cancelled'
+  | 'submitted'
+  | 'failed'
   | 'resolved';
 
 /** Subset of ApprovalDecision that can be chosen by the user (excludes server-set 'resolved'). */
-export type ResolvableApprovalDecision = Exclude<ApprovalDecision, 'resolved'>;
+export type ResolvableApprovalDecision = Exclude<ApprovalDecision, 'resolved' | 'submitted' | 'failed'>;
 
 /** Network policy amendment proposed by the server. */
 export interface NetworkPolicyAmendment {
@@ -78,17 +82,28 @@ export type RawCommandDecision =
 
 /** A pending approval request from the Codex app-server. */
 export interface ApprovalRequest {
+  /** Absent only on pre-upgrade cards, which cannot submit a decision. */
+  instanceId?: string;
+  /** Backend-validated permissions or MCP form; never inferred from raw JSON. */
+  presentation?: InteractionPresentationDto | null;
+  negativeOnlyReason?: string | null;
   /** JSON-RPC request ID — must be included in the response. */
   requestId: number | string;
   /** Approval type discriminator. */
-  kind: 'command' | 'writeStdin' | 'fileChange';
+  kind: 'command' | 'writeStdin' | 'fileChange' | 'permissions' | 'elicitation';
   /** Stable protocol approval identity, when supplied independently of RPC ID. */
   approvalId?: string | null;
   threadId: string;
-  turnId: string;
+  turnId: string | null;
   itemId: string;
   /** Current status. */
   status: 'pending' | ApprovalDecision;
+  /**
+   * What this browser submitted, retained separately from `status`: the
+   * lifecycle is app-server's to confirm, the choice is the user's own and
+   * stays displayable after the card stops awaiting a decision.
+   */
+  decision?: ResolvableApprovalDecision;
   /** Shell command (command approvals only). */
   command?: string | null;
   /** Working directory (command approvals only). */
@@ -97,6 +112,28 @@ export interface ApprovalRequest {
   reason?: string | null;
   /** Root path the agent wants write access to (fileChange only). */
   grantRoot?: string | null;
+  /**
+   * App-server process generation this request belongs to.
+   *
+   * Informational process scope only: the backend counter can restart too.
+   * Modern response and retirement matching require the immutable instanceId.
+   */
+  generation?: number | null;
+  /**
+   * The files this approval would write (fileChange only).
+   *
+   * Supplied by the backend rather than read from the item stream, because the
+   * pending item is measurably absent from history while its approval is
+   * outstanding — a client that never received the conversation's items has no
+   * other way to see what it is being asked to allow.
+   *
+   * Tri-state, and the distinction is the point:
+   *  - array — the complete proposed change set
+   *  - `null` — this IS a file approval and the changes could not be shown.
+   *    Accepting is refused by the backend; only Decline/Cancel are offered.
+   *  - `undefined` — not a file approval, or a payload predating the subject.
+   */
+  reviewChanges?: FileChangeEntry[] | null;
   /** Server-provided list of allowed decisions (command/writeStdin only). */
   availableDecisions?: RawCommandDecision[] | null;
   /** Server-proposed exec policy amendment patterns (command only). */
@@ -134,12 +171,16 @@ export interface UserInputQuestion {
 
 /** A pending user-input request from the Codex app-server (EXPERIMENTAL). */
 export interface UserInputRequest {
+  /** Required by the response API; legacy cards must refresh before answering. */
+  instanceId?: string;
   /** JSON-RPC request ID — must be included in the response. */
   requestId: number | string;
+  /** Informational process scope; instanceId identifies modern requests. */
+  generation?: number | null;
   kind: 'userInput';
   threadId: string;
   turnId: string;
   itemId: string;
-  status: 'pending' | 'resolved';
+  status: 'pending' | 'submitted' | 'failed' | 'resolved';
   questions: UserInputQuestion[];
 }

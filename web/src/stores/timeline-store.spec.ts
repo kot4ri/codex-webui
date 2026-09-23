@@ -13,7 +13,7 @@ const emit = vi.fn();
 // The store reaches for the socket singleton on subscribe/forget paths; a real
 // one would try to open a websocket under jsdom.
 vi.mock('../socket', () => ({
-  getSocket: () => ({ emit, on: vi.fn(), off: vi.fn() }),
+  getSocket: () => ({ emit, timeout: () => ({ emit }), connected: true, on: vi.fn(), off: vi.fn() }),
 }));
 
 const { useTimelineStore } = await import('./timeline-store');
@@ -62,12 +62,12 @@ describe('recovery lifecycle ordering', () => {
     ]);
     const runtime = useTimelineStore.getState().getThreadRuntime('t1')!;
     expect(runtime.activeTurnId).toBeNull();
-    expect(runtime.loading).toBe(false);
+    expect(runtime.turnStartPending).toBe(false);
   });
 });
 
 describe('history dedup', () => {
-  it('does not re-insert a turn that only ever produced a user entry', () => {
+  it('keeps one user prompt and its lifecycle when a user-only turn is paged again', () => {
     const store = useTimelineStore.getState();
     const turn = userOnlyTurn('turn-1', 'hello');
 
@@ -79,14 +79,14 @@ describe('history dedup', () => {
     });
 
     const seeded = useTimelineStore.getState().getThreadRuntime('t1')!;
-    expect(seeded.timeline).toHaveLength(1);
-    expect(seeded.timeline[0].kind).toBe('user');
+    expect(seeded.timeline.filter((entry) => entry.kind === 'user')).toHaveLength(1);
+    expect(seeded.timeline.filter((entry) => entry.kind === 'turn')).toHaveLength(1);
 
     // The cursor page is inclusive of its anchor, so a retry re-delivers it.
     useTimelineStore.getState().prependHistoryForThread('t1', [turn], null);
 
     const after = useTimelineStore.getState().getThreadRuntime('t1')!;
-    expect(after.timeline).toHaveLength(1);
+    expect(after.timeline).toEqual(seeded.timeline);
   });
 
   it('still prepends genuinely older turns', () => {
@@ -106,6 +106,7 @@ describe('history dedup', () => {
       .getState()
       .getThreadRuntime('t1')!.timeline;
     expect(timeline.map((entry) => entry.turnId)).toEqual([
+      'turn-1',
       'turn-1',
       'turn-2',
       'turn-2',
@@ -192,11 +193,11 @@ describe('reopening a thread', () => {
   });
 });
 
-describe('locally recorded datasets fill gaps but never overwrite live', () => {
+describe('unbaselined recordings preserve existing observations', () => {
   // Token usage and turn diffs have no historical read on app-server; the rows
   // come from this project's own database, written from the same notifications
-  // the browser already received. The recording is therefore never newer than
-  // live, and a hydrate that lands after one must not revert it.
+  // the backend received. These calls have no read baseline, so existing
+  // observations remain protected; baselined gap repair is tested separately.
   it('keeps a token usage value that arrived while the read was in flight', () => {
     const store = useTimelineStore.getState();
     store.ensureThreadState({ threadId: 't1' });
@@ -338,8 +339,8 @@ function summaryTurn(id: string, text: string): TurnDto {
   } as unknown as TurnDto;
 }
 
-describe('on-demand turn item top-up', () => {
-  it('keeps an entry for a summary turn so the top-up has somewhere to land', () => {
+describe('explicit full-item recovery', () => {
+  it('retains lifecycle for sparse history until explicit recovery supplies the items', () => {
     useTimelineStore.getState().hydrateOpenedThread({
       threadId: 't1',
       turnsNewestFirst: [summaryTurn('turn-1', 'hi')],
@@ -380,29 +381,29 @@ describe('on-demand turn item top-up', () => {
     ).toEqual(['reasoning']);
   });
 
-  // A persisted snapshot is older than anything that streamed in live, so it
-  // must never replace a turn that notifications have already rebuilt.
-  it('refuses to overwrite a turn that is no longer summary', () => {
-    useTimelineStore.getState().hydrateOpenedThread({
+  it('adds late items to full history while retaining an already observed terminal payload', () => {
+    const store = useTimelineStore.getState();
+    store.hydrateOpenedThread({
       threadId: 't1',
       turnsNewestFirst: [answeredTurn('turn-1', 'hi')],
       historyCursor: null,
       readOnlyReason: null,
     });
-
-    useTimelineStore
-      .getState()
-      .applyFullTurnItemsForThread('t1', 'turn-1', [
-        { type: 'agentMessage', id: 'stale', text: 'stale snapshot' },
-      ]);
-
-    const runtime = useTimelineStore.getState().getThreadRuntime('t1')!;
-    const turnEntry = runtime.timeline.find((e) => e.kind === 'turn')!;
-    expect(
-      turnEntry.kind === 'turn' &&
-        turnEntry.items[0]?.type === 'agentMessage' &&
-        turnEntry.items[0].content,
-    ).toBe('reply');
+    const before = store.getThreadRuntime('t1')!.timeline.find((entry) => entry.kind === 'turn')!;
+    if (before.kind !== 'turn') throw new Error('Expected a turn');
+    const answerId = before.items[0].itemId;
+    const snapshot = [
+      { type: 'agentMessage', id: answerId, text: 'stale snapshot' },
+      { type: 'subAgentActivity', id: 'subagent-completed-child', kind: 'completed', agentThreadId: 'child', agentPath: '/root/child' },
+    ];
+    store.applyFullTurnItemsForThread('t1', 'turn-1', snapshot);
+    store.applyFullTurnItemsForThread('t1', 'turn-1', snapshot);
+    const after = store.getThreadRuntime('t1')!.timeline.find((entry) => entry.kind === 'turn')!;
+    expect(after).toMatchObject({ completed: true, itemsView: 'full' });
+    if (after.kind !== 'turn') throw new Error('Expected a turn');
+    expect(after.items).toHaveLength(2);
+    expect(after.items.find((item) => item.itemId === answerId)).toMatchObject({ content: 'reply' });
+    expect(after.items.find((item) => item.itemId === 'subagent-completed-child')).toMatchObject({ completed: true });
   });
 });
 
@@ -524,7 +525,7 @@ describe('markThreadDeletedRemotely', () => {
     });
     // An in-flight turn must not survive the lockout as a spinner that never ends.
     useTimelineStore.getState().setActiveTurnIdForThread('t1', 'turn-1');
-    useTimelineStore.getState().setLoadingForThread('t1', true);
+    useTimelineStore.getState().setTurnStartPendingForThread('t1', true);
 
     useTimelineStore
       .getState()
@@ -532,7 +533,7 @@ describe('markThreadDeletedRemotely', () => {
 
     const runtime = useTimelineStore.getState().getThreadRuntime('t1')!;
     expect(runtime.deletedRemotely).toBe(true);
-    expect(runtime.loading).toBe(false);
+    expect(runtime.turnStartPending).toBe(false);
     expect(runtime.activeTurnId).toBeNull();
     // A dangling cursor would offer to page a conversation that is gone.
     expect(runtime.historyCursor).toBeNull();
@@ -593,6 +594,36 @@ describe('approval request identity', () => {
     const runtime = useTimelineStore.getState().getThreadRuntime('t1')!;
     expect(runtime.approvals['late-request'].status).toBe('resolved');
     expect(runtime.pendingResolvedRequestIds.has('late-request')).toBe(false);
+  });
+
+  it('does not reopen an answered request when the same delivery repeats', () => {
+    // Attention now reaches every authenticated browser, a deletion guard
+    // replays what it withheld, and recovery reads the same row back — so one
+    // request legitimately arrives several times. Resetting an answered card to
+    // pending would offer the decision a second time and let the user act on a
+    // request the server has already closed.
+    const store = useTimelineStore.getState();
+    store.addApprovalForThread('t1', approval('replayed', { generation: 4 }));
+    store.resolveApprovalForThread('t1', 'replayed', 'declined');
+    store.addApprovalForThread('t1', approval('replayed', { generation: 4 }));
+
+    expect(
+      useTimelineStore.getState().getThreadRuntime('t1')!.approvals.replayed
+        .status,
+    ).toBe('declined');
+  });
+
+  it('treats the same request ID from a new generation as a new request', () => {
+    // Request IDs restart with the app-server child process, so an ID answered
+    // before a restart says nothing about the one that reuses it afterwards.
+    const store = useTimelineStore.getState();
+    store.addApprovalForThread('t1', approval('7', { generation: 1 }));
+    store.resolveApprovalForThread('t1', '7', 'declined');
+    store.addApprovalForThread('t1', approval('7', { generation: 2 }));
+
+    const runtime = useTimelineStore.getState().getThreadRuntime('t1')!;
+    expect(runtime.approvals['7'].status).toBe('pending');
+    expect(runtime.approvals['7'].generation).toBe(2);
   });
 
   it('preserves the approval callback turn across timeline hydration', () => {
@@ -732,10 +763,8 @@ describe('forgetThreads', () => {
 
   it('leaves the socket room for a subscribed doomed thread', () => {
     const store = useTimelineStore.getState();
-    // Subscribing happens on open; selecting another thread leaves the first
-    // subscribed in the background, which is the state deletion has to unwind.
+    // Deleting the currently subscribed transcript must leave its room.
     store.setActiveThread('background');
-    useTimelineStore.getState().setActiveThread('other');
     emit.mockClear();
 
     useTimelineStore.getState().forgetThreads(['background']);
@@ -914,7 +943,7 @@ describe('failures hydrated before their turn was paged in', () => {
     expect(failures).toHaveLength(1);
     const at = timeline.indexOf(failures[0]);
     expect(timeline[at - 1]).toMatchObject({
-      kind: 'user',
+      kind: 'turn',
       turnId: 'turn-old',
     });
     expect(timeline[at + 1]).toMatchObject({
@@ -942,4 +971,91 @@ describe('failures hydrated before their turn was paged in', () => {
     );
     expect(failures).toHaveLength(1);
   });
+});
+
+describe('selection is not hydration', () => {
+  // Selecting a thread used to report it hydrated, because the flat selected
+  // state had no hydration field and the runtime projection hardcoded `true`.
+  // That is not a read-only misreport: the flat state is persisted back into
+  // `threadsById` on every update, so one selection permanently marked a
+  // never-loaded thread as loaded.
+  it('does not report a selected but never-loaded thread as hydrated', () => {
+    const store = useTimelineStore.getState();
+    store.ensureThreadState({ threadId: 't1' });
+    store.selectThread('t1');
+
+    expect(useTimelineStore.getState().getThreadRuntime('t1')!.hydrated).toBe(
+      false,
+    );
+  });
+
+  it('does not persist a false hydration claim when selection moves away', () => {
+    const store = useTimelineStore.getState();
+    store.ensureThreadState({ threadId: 't1' });
+    store.ensureThreadState({ threadId: 't2' });
+    store.selectThread('t1');
+    // Any update while selected writes the flat state back into threadsById.
+    useTimelineStore.getState().setThreadTitleForThread('t1', 'still empty');
+    useTimelineStore.getState().selectThread('t2');
+
+    expect(useTimelineStore.getState().getThreadRuntime('t1')!.hydrated).toBe(
+      false,
+    );
+  });
+
+  it('reports hydrated once the thread has actually been opened', () => {
+    const store = useTimelineStore.getState();
+    store.selectThread('t1');
+    useTimelineStore.getState().hydrateOpenedThread({
+      threadId: 't1',
+      turnsNewestFirst: [answeredTurn('turn-1', 'hi')],
+      historyCursor: null,
+      readOnlyReason: null,
+    });
+
+    expect(useTimelineStore.getState().getThreadRuntime('t1')!.hydrated).toBe(
+      true,
+    );
+  });
+});
+
+it('leaves the previous transcript room without evicting its cached content', () => {
+  const store = useTimelineStore.getState();
+  store.setActiveThread('first');
+  store.hydrateOpenedThread({ threadId: 'first', turnsNewestFirst: [answeredTurn('turn', 'kept')], historyCursor: null, readOnlyReason: null });
+  store.setActiveThread('second');
+  expect(useTimelineStore.getState().subscribedThreadIds).toEqual(new Set(['second']));
+  expect(emit).toHaveBeenCalledWith('thread.unsubscribe', { threadId: 'first' });
+  expect(store.getThreadRuntime('first')?.timeline.length).toBeGreaterThan(0);
+  store.selectThread(null);
+  expect(useTimelineStore.getState().subscribedThreadIds.size).toBe(0);
+});
+
+it('refreshes pre-gap diffs while preserving a diff observed during the read', () => {
+  const store = useTimelineStore.getState();
+  store.hydrateOpenedThread({ threadId: 't', turnsNewestFirst: [answeredTurn('turn', 'hi')], historyCursor: null, readOnlyReason: null });
+  store.updateTurnDiffForThread('t', 'turn', 'partial');
+  const baseline = store.getThreadRuntime('t')!;
+  store.hydrateTurnDiffsForThread('t', [{ turnId: 'turn', diff: 'completed' }], baseline);
+  expect(store.getThreadRuntime('t')?.timeline.find((entry) => entry.kind === 'turn')?.diff).toBe('completed');
+  const later = store.getThreadRuntime('t')!;
+  store.updateTurnDiffForThread('t', 'turn', 'live-after-read');
+  store.hydrateTurnDiffsForThread('t', [{ turnId: 'turn', diff: 'stale' }], later);
+  expect(store.getThreadRuntime('t')?.timeline.find((entry) => entry.kind === 'turn')?.diff).toBe('live-after-read');
+});
+
+it('replaces pre-gap token usage but preserves a live update received during the read', () => {
+  const store = useTimelineStore.getState();
+  const partial = { totalTokens: 1 } as unknown as ThreadTokenUsage;
+  const finished = { totalTokens: 20 } as unknown as ThreadTokenUsage;
+  const live = { totalTokens: 30 } as unknown as ThreadTokenUsage;
+  store.setTokenUsageForThread('t', 'turn', partial);
+  const baseline = store.getThreadRuntime('t')!;
+  store.hydrateTokenUsageForThread('t', [{ turnId: 'turn', usage: finished }], baseline);
+  expect(store.getThreadRuntime('t')?.latestTokenUsage).toBe(finished);
+  const later = store.getThreadRuntime('t')!;
+  store.setTokenUsageForThread('t', 'turn', live);
+  store.hydrateTokenUsageForThread('t', [{ turnId: 'turn', usage: finished }], later);
+  expect(store.getThreadRuntime('t')?.tokenUsageByTurn.turn).toBe(live);
+  expect(store.getThreadRuntime('t')?.latestTokenUsage).toBe(live);
 });

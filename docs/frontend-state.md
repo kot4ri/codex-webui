@@ -23,7 +23,10 @@ Multi-thread 架构：`threadsById` 存储所有 thread 的独立运行时状态
 | `threadTitle` | `string \| null` | 当前 thread 标题 |
 | `threadMode` | `'live' \| 'readOnly'` | live = 可交互; readOnly = 归档快照 |
 | `timeline` | `TimelineEntry[]` | 当前 thread 的消息时间线 |
-| `loading` | `boolean` | 是否有 turn 进行中 |
+| `turnStartPending` | `boolean` | turn/start 已派发但尚未由响应或 lifecycle 对齐 |
+| `openState` | opening/ready/error/unopened | 打开与写入准备状态 |
+| `historyRequest` / `historyError` | request state / error | full 历史请求状态，与已有可用内容及执行状态独立 |
+| `hydrated` | `boolean` | 已有有效 full 历史（包括合法空页） |
 | `expandedReasoning` | `Set<string>` | 展开的 reasoning item ID 集合 |
 | `approvals` | `Record<string, ApprovalRequest>` | 按 JSON-RPC requestId 索引的审批请求；同一 command item 的 command/writeStdin 回调不会互相覆盖 |
 | `userInputRequests` | `Record<string, UserInputRequest>` | 按 requestId 索引的用户输入请求（EXPERIMENTAL） |
@@ -54,7 +57,7 @@ Multi-thread 架构：`threadsById` 存储所有 thread 的独立运行时状态
 
 `TurnItem` 是 discriminated union，不再用一组跨类型 optional 字段表达。内部覆盖当前 17 个可渲染分支：既有 reasoning/message/MCP/command/file/review/compaction，加上 hook prompt、standalone function output、dynamic tool、collaboration、sub-agent activity、web search、image view、sleep、image generation，以及 `unknownActivity` 安全 fallback。
 
-`lib/thread-item-normalizer.ts` 是 live `item/{started,completed}` 与 persisted history/top-up 的唯一纯归一化入口。结果显式区分 render、unknown、userMessage、plan、invalid；未来协议类型被转换成只含 `protocolType`、`itemId`、`completed` 的 `unknownActivity`，原 payload 不进入页面。renderer 对内部 union 穷尽 switch，无 catch-all，因此新增内部分支却没 UI 会在编译期失败。结构化 function output 的 encrypted branch 只保留“已加密”标记，不保留 ciphertext。
+`lib/thread-item-normalizer.ts` 是 live `item/{started,completed}` 与 persisted history/recovery 的唯一纯归一化入口。结果显式区分 render、unknown、userMessage、plan、invalid；未来协议类型被转换成只含 `protocolType`、`itemId`、`completed` 的 `unknownActivity`，原 payload 不进入页面。renderer 对内部 union 穷尽 switch，无 catch-all，因此新增内部分支却没 UI 会在编译期失败。结构化 function output 的 encrypted branch 只保留“已加密”标记，不保留 ciphertext。
 
 ### Actions
 
@@ -79,13 +82,21 @@ Multi-thread 架构：`threadsById` 存储所有 thread 的独立运行时状态
 | `setLoading` | socket hook | turn/completed 时设 false |
 | `upsertTurnFailure` | socket / persistence hydration | 按 turnId 插入或合并结构化失败；稀疏终止通知不会清掉更早的丰富字段 |
 
-### 订阅清理
+### 订阅范围
+
+**房间只跟随正在看的转录。** 启动期那轮「列出全部已加载会话（最多 3 页 600 个）→ 逐个订阅 → 逐个 resume」已退休：它存在是为了回答两个问题——谁在跑、哪里等着人做决定——而这两个都不需要房间。前者来自会话列表自己的 `thread.status`（`conversation.overview.changed` 到达时刷新），后者走全局注意力投递。后台会话徽章以服务端行为准；只有仍在订阅的 runtime 才提供即时生命周期覆盖，离开房间后的旧 active/submission 不再把已完成会话显示为运行中。
+
+当前会话由路由的唯一打开入口负责；重连时的修复只遍历 `subscribedThreadIds`，收窄后通常只有一个。
+
+### 空闲清理
 
 `general.maxIdleSubscriptions` 默认 30（范围 5-200），由 Settings General tab 配置。`authenticated-layout` 通过 `GET /api/settings?category=general` 读取后写入 timeline-store，并每 5 分钟触发一次清理。
 
-清理只处理 safe idle runtime：非当前选中 thread、`loading=false`、无 `activeTurnId`、无 `pendingResolvedRequestIds` 缓冲、`threadStatus` 不是 `active`、无 pending approval、无 pending user-input。候选按 `lastActivityAt` 排序，超过 15 分钟未活动的 thread 在超过上限时优先被驱逐。
+它现在实质上是 **可安全回收的空闲 runtime 数量上限**而非所有 runtime 或订阅的硬上限：扫描 `threadsById` 里**全部**保留的 runtime，而不再只扫订阅集。全局注意力会为从未打开、也从未订阅的会话创建 runtime，只扫订阅集会让这些永远回收不到，在长会话里持续累积。
 
-每个被驱逐的 thread 会先从 `subscribedThreadIds` 和 `threadsById` 删除，再 emit `thread.unsubscribe` 让后端 socket room 与 `ActiveThreadRegistryService` ref-count 同步。再次打开该 thread 时走现有 `setActiveThread` + `thread/resume` 恢复路径。
+清理只处理 safe idle runtime：非当前选中 thread、`turnStartPending=false`、`openState` 非 opening、`historyRequest` 非 loading、`historyLoading=false`、无等待确认的 policy patch、无 `activeTurnId`、无 `pendingResolvedRequestIds` 缓冲、`threadStatus` 不是 `active`、无 pending approval、无 pending user-input。**后两条正是全局注意力安全的前提**——等着人做决定的会话不会被回收掉。候选按 `lastActivityAt` 排序，超过 15 分钟未活动的 thread 在超过上限时优先被驱逐。
+
+每个被驱逐的 thread 会先从 `subscribedThreadIds` 和 `threadsById` 删除，连接可用且原先在订阅集时 emit `thread.unsubscribe` 离开后端 socket room；后端执行恢复 inventory 不受 room 成员资格影响。再次打开该 thread 时走现有 `setActiveThread` + `thread/resume` 恢复路径。
 
 ### 打开线程的唯一入口 (use-thread-open)
 
@@ -101,9 +112,9 @@ Multi-thread 架构：`threadsById` 存储所有 thread 的独立运行时状态
 - **打开不覆盖实时状态**（`lib/timeline-reconcile.ts`）：订阅与 open 请求并发，刷新时通知可能先于响应写入时间线；旧实现整体替换会把它们抹掉，正是「刷新后运行中轮次一片空白」的第二个成因。现在按 **turn 分组**对账：一个 turn 会贡献多行（user 行、turn 行、failure 行），先按 turn 分组、组内按 kind 对账、每组整体落位一次；组内按 user → turn → failure 排列（这是页面结构顺序，不是重叠 item 的时间顺序）。锚定粒度与取值粒度必须一致——早先按 turnId 锚定却按 `kind:turnId` 取值，页面独有的行会被当成「该 turn 已表示」而整行丢失（刷新时用户自己的消息会消失），且尾随组会在锚点 turn 的**每一行**后重复发出（整个 turn 被复制并错位）。两侧共有的 turn 合并（item 按下述权威规则、`completed` 只前进、更细的 `itemsView` 胜出），仅一侧有的按最近共有锚点插入。**仅当两侧存在共有 turn 时才合并**；毫无重叠说明是两个断开的历史窗口，仍以服务端整体替换并采用其游标，避免把缺口悄悄缝合掉。
 - **活跃 turn 指针不由页面独断**：返回页没有 inProgress turn 不等于没有——它可能在请求期间才开始。只有当该页确实覆盖了本地已知的活跃 turn 并报告其已结束时才清空指针。
 - **迟到响应保护**：成功与失败回调都先检查运行时是否仍存在。store 的 setter 是 create-if-absent 的，删除进行中若有 in-flight 响应落地，不加保护会把已删会话的外壳重新建出来。
-- **后台恢复不写指针**：刷新/重连恢复会遍历所有已加载线程，若允许它们写活跃分支指针，每棵树会指向恢复顺序中的最后一个成员，正是该指针要解决的问题。这两条路径显式传 `recordActive: false`。
+- **后台恢复不写指针**：浏览器不再遍历全部已加载线程；重启后只恢复当前转录并传 `recordActive:false`，连接重连只读取，不 resume。后端执行 inventory 保持独立。
 - **fork 也只导航**：钉住的 0.153.2 fork 响应刻意请求 metadata-only。侧边栏不再从响应里的 `thread.turns` 或并行 auxiliary reads 自行 hydration；后端提交 provenance 后才返回，随后路由的 canonical opener 统一分页历史并读取继承后的 token usage / turn diff / turn error。
-- **降级只读同样分页**：正常 resume 失败后，路由并行读取 metadata 与最近 20 个 summary turns，两者都成功且路由仍指向目标 thread 时才应用；更早历史沿用同一个 `historyCursor` 与显式“加载更早的消息”入口。已有 live runtime 会被显式切换为 `readOnly`，避免只读快照仍保留可写模式。
+- **降级只读同样分页**：正常 resume 失败后，路由并行读取 metadata 与最近 20 个 full turns，两者都成功且路由仍指向目标 thread 时才应用；更早历史沿用同一个 `historyCursor` 与显式“加载更早的消息”入口。已有 live runtime 会被显式切换为 `readOnly`，避免只读快照仍保留可写模式。
 
 Approval 与 user-input request 会为自己的 `turnId` 保留空 turn entry，即使最近一页历史没有该 turn。`writeStdin` 回调的 item 可属于更早的 turn，因此卡片按回调 turn 渲染为 unattached request，而不是倒挂回原 command 或改变其 lifecycle。
 
@@ -113,9 +124,9 @@ Approval 与 user-input request 会为自己的 `turnId` 保留空 turn entry，
 
 **A 类：app-server 是权威。** thread item、turn 生命周期、安全策略、线程设置、observed 模型设置。实时通知与 REST 读取是**同一份服务端状态的两个视角**，谁新都有可能——T 时刻发出的读取带回 T 的状态，而 T+0.5 的通知可能先到达。这里必须显式比顺序：请求发出前捕获 `currentObservationSeq()` 作为基线，实时写入时用 `nextObservationSeq()` 盖戳，冲突时 `observedSeq > baselineSeq` 的一侧胜出。策略读取另有一套按发出顺序排序的序号（见 [thread-policy-recovery.md](thread-policy-recovery.md)）。
 
-**B 类：本项目自己的 SQLite，内容是实时通知的录音。** token usage、turn diff、turn error。`TokenUsageService` / `TurnDiffService` / `TurnErrorsService` 都是订阅 app-server 通知后落库；**app-server 不提供这三样的历史读取**，本地持久化的唯一理由就是实时流过去便再也取不到。既然录音是从同一条通知晚一跳写下的，它**不可能比实时新**，因此规则是「实时有就用实时的，DB 只填空、永不覆盖」，不需要任何序号。
+**B 类：本项目自己的 SQLite，内容是后端实时通知的录音。** token usage、turn diff、turn error 都由后端持久化。后端持续接收而浏览器会断线或离开房间，所以录音完全可能比浏览器缓存更新。token/diff 读取捕获请求发出时的 runtime 基线：仅当对应字段在读取期间没有变化时替换已有值；在途期间的实时观察仍然优先。不带基线的旧调用保持填空语义。错误记录继续做稀疏字段合并。这里使用已有不可变字段引用比较，没有新增序号或持久化快照。
 
-`hydrateTurnErrorsForThread` 一直按 B 类规则合并（`incoming ?? existing`）；`hydrateTokenUsageForThread` 与 `hydrateTurnDiffsForThread` 曾写成整表替换与直接覆盖，会把请求在途期间到达的实时值回退成更旧的录音，现已改为填空。**给 B 类数据加观测序号是错的**：那是 A 类的机制，既多余又意味着承认录音可能更新。
+所有异步回填必须校验 runtime 仍存在且读取所属 epoch 未被替换。删除和空闲驱逐会推进 epoch，并从在途 pending 读取中排除这些会话，防止重新打开后的新 runtime 被旧快照复活已答复卡片；普通传输修复只使旧 item 恢复失效，不使并行的有效 open 响应失效。
 
 ### Item 权威与恢复合并 (`lib/turn-item-merge.ts`)
 
@@ -131,9 +142,16 @@ Approval 与 user-input request 会为自己的 `turnId` 保留空 turn entry，
 
 ### 运行中轮次与重连恢复 (`lib/thread-recovery.ts`)
 
-open 与重连共用 item 修复入口；重连另读 turn 头。请求前捕获观测基线与 recovery epoch，应用前重新校验（会话可能已删除/驱逐/被更新的恢复取代）。**in-flight 去重的 key 必须含 epoch**：否则被 supersede 的旧 promise 仍占着位置，替补恢复会复用它并在 epoch 校验处被丢弃，结果是一次修复都不会发生。
+Open 和重连获取 full turns pages，保持观测基线与 recovery epoch：覆盖到的轮次同时恢复 item 和 lifecycle，不再另发 N 个 per-turn 请求。
 
-重连恢复的**另一半是 turn 生命周期**，不是只有 item。item 与 lifecycle 由不同通知承载：断线期间完成的 turn 把它的 `turn/completed` 发进了空处，只补 item 会让转录正确而 composer 永远转圈。因此重连会以 `itemsView: notLoaded` 重读最近的 turn 头（不带 item，与 item 合并互不干扰）并据此收敛 `completed` / `activeTurnId` / `loading`：只前进、只对**头里确实出现**的 turn 下结论（读取有界，更早的 turn 只是超出范围），并接管断线期间新开的运行中 turn 指针；已经终态的本地 turn 不被迟到的 running 头重新激活。新接管的活跃 turn 会建立转录行并补读 item/提示词；未完成 plan 同样纳入恢复。启动与重连共用 pending 审批同步，按请求发出前的状态及会话范围避免误清新请求、重开已解决请求。整个轮次在断线期间开始并结束的缺口仍需最近历史页刷新，不能靠旧历史游标补齐。两者并行发出，让生命周期不必等最慢的转录分页。分页只认 `complete` 字段——`nextCursor` 为空也可能意味着分页不可用或响应损坏，把它当作「就这些了」会让被截断的转录看起来权威。失败的读取不恢复任何东西，也不声称完整。
+页外未覆盖的轮次按**两种依据**分别补读，最多四个并发 worker，每项最多十页，只认明确的 `complete`，不把空 cursor 当完整证据：
+
+- **有中断证据**（存在未终结的 item / plan 片段，或被认为正在运行的那一轮）——transcript 此刻就是错的，因此阻塞 cold reveal，失败计入「恢复不完整」并显示错误。
+- **仅是页外的已完成轮次**——只为迟到子代理项做扫描（这类 item 在父轮 `turn/completed` 之后到达）。没有任何标记表示某轮「已扫过」，所以无界扫描会在**每次重连**全量重发，且随读者加载的页数线性增长。该扫描因此被限制为最近读到的 **8** 轮、丢弃项写日志，且**失败不影响 open**——一轮读不到的旧轮次不该把一份可读的 transcript 换成错误页。超出上限的迟到项不覆盖。
+
+warm full 内容在刷新失败后保留。
+
+请求前捕获基线，应用前验证 epoch 和 runtime，已删除/驱逐/被取代的读取不能复建会话。只对返回的 turn 状态收敛生命周期，不从缺席推断结束；实时终态比迟到 running 快照优先。已有 full 数据无 per-row fetch，滚动只触发更早的 full page 预取。
 
 ### 历史恢复 (turnsToTimeline)
 
@@ -145,15 +163,15 @@ open 与重连共用 item 修复入口；重连另读 turn 头。请求前捕获
 - 未知 variant → 可见 `unknownActivity`，只显示类型与 lifecycle
 - failed turn → `turnFailure`；随后本地 `/turn-errors` hydration 合并保留的 category、additional details 与 misalignment explanation
 
+## 工作区与文档所有权
+
+`workspace-store` 的 tabs、active view、view bookmark 只驻留内存；runtime idle eviction 不删除它们。`document-store` 按绝对路径共享 Monaco 工作模型，dirty model 脱离编辑器仍保留，保存 revision 永远与提交的文本成对。`terminal-view-store` 保留本浏览器 attachment，独立于 shared session 和 tab descriptor。详见 [workspace-tabs.md](workspace-tabs.md)。
+
+`timeline-store` 保持原有公开入口，内部按类型、runtime 投影、历史转换/恢复、轮次与交互 mutation 拆分为 `timeline-*` 模块。
+
 ## files-store
 
-文件: `web/src/stores/files-store.ts`
-
-详见 [files-service.md](files-service.md)。
-
-核心字段: `rootDir`（当前浏览目录）、`selectedFile`、`fileMtime`、`panelOpen`。REST 数据由 TanStack Query 管理，store 仅管 UI 状态。
-
-文件操作 mutations 集中在 `hooks/use-file-operations.ts`（详见 [files-service.md](files-service.md)）。
+仅持有 tree 的 root/expanded directories 与独立 Files route 的单选路径。文件内容、保存基线与 dirty draft 由 `document-store` 持有；行号意图和 editor bookmark 由 `workspace-store` 的 view record 持有。旧 `panelOpen` 与全局 `pendingLine` 已移除。
 
 ## model-store
 
@@ -174,7 +192,7 @@ Session 级的模型 / 推理强度 / 速度档位 override，随每次 `turn/st
 
 推理强度与速度档位都是逐模型 advertise 的，切换模型时两者一并重置（`setServiceTierOverride(undefined)`），否则可能残留新模型没有的档位。
 
-两张观测表由两条路径写入：`thread/settings/updated` 通知，以及 `applyOpenResponse` 中的开线程水合。**光靠通知不够** —— 它只在设置发生变化时才发，所以重新打开或刷新后的线程会退回目录默认值：速度选择器会对一个实际跑在付费档的线程显示「标准」，而 composer 因为 override 是 `undefined` 又不发 `serviceTier`，该档位继续生效。用户会以为自己在标准速度和标准计费上。`forgetObservedThreadEffort` 同时清两张表和观测序号，且早退条件必须同时检查两者 —— 只看 effort 会漏掉只有 tier 记录的线程。
+effort 接收设置通知和 open seed；service tier 仅保留 start/resume/fork 响应提供的本地 seed。实测 tier 变更没有通知，也没有被动读取；无关设置通知不能清除或伪造 tier。通知先于响应时仍允许补齐缺失的首个 tier seed。显示按参考客户端的模型支持过滤：已有配置但不支持时显示通用 Speed，不改写成 Standard 或目录默认值；没有配置时仅采用受支持的目录默认值，显式 default 才表示 Standard。没有跨浏览器同步或为读显示而 resume。`forgetObservedThreadEffort` 同时清两张表与观测序号。
 
 ## connection-store
 
@@ -217,6 +235,22 @@ Socket.IO / thread runtime 不依赖 layout store。
 useCodexSocket → store mutation → React re-render
 ```
 
-完整及部分 top-up 的共享 Query 缓存都不携带请求发出时的观测基线，因此采用保守的未知基线：保留已有终态载荷，仍用持久终态修复片段；不能在响应应用时补打时间序号。
+历史/恢复 owner 在请求前记录观测基线；未知基线的显式 full-item 应用仍保守保留已有终态。已移除随行挂载触发的 Query top-up。
 
 Plan prose 按 item 保存 `{ text, completed, observedSeq }`，终态后拒绝 delta；恢复中的持久终态替换流式片段，但请求发出后到达的实时终态保留。
+
+## 请求实例与交互行
+
+卡片的 wire requestId 只用于本地索引，`instanceId` 才是提交、恢复、退休和迟到回调的身份。两浏览器由后端 CAS 决定胜者。`submitted` 表示本地提交，不能当成已确认执行；失败不会重开 pending。原始 `serverRequest/resolved` 不直接按裸 ID 清现代卡片。
+
+权限与 MCP 请求保存在 approvals 中，以独立 `interaction` 行渲染。行 key 使用 instance，MCP 无 turnId 时也不伪造 turn 或调用历史补页。失败说明作为带 requestInstanceId 的 system 行幂等恢复，不改变 submission/activeTurnId。
+
+`ApprovalRequest.decision` 保存本浏览器成功提交的选择，与 submitted/resolved/failed 生命周期独立。终态先到、HTTP 成功后到时只补归因，不逆转终态；同 wire ID 的新 instance 不继承旧选择。消费退休 tombstone 时删除实际查询的 instance key，重复投递不重开已退休的卡片。失败恢复的范围与 20 条上限见 [approval.md](approval.md)。
+
+完成 turn 的 `full` 仅表示读取 detail，不表示 item 集合永远封闭。迟到事件仍按原 thread/turn/item 身份摄入；遗漏由 open/reconnect/app-server recovery 负责，行渲染不发请求。详见 [completed-turn-items.md](completed-turn-items.md)。
+
+后台迟到项 sweep 与必要恢复分开等待：当前书签所属 turn 优先进入八轮预算，sweep 不阻塞 open，也不把失败写成首屏请求失败。保留了有界读取取舍，预算外历史不宣称已刷新。只读降级同样在恢复历史书签后才 ready。
+
+### Shared terminal recovery
+
+`terminal-store` 区分 durable terminal id 和物理 sessionId/generation；typed ACK 不把 timeout/auth/context mismatch 当成 expired。明确 closed 状态拒绝后来的旧 metadata，close 对所有生命周期状态请求后端。`use-terminal-discovery` 仅 list + attach 后加入 workspace，不选择 tab、不调用 recover；context removal 使迟到结果失效。`TerminalHost` 保留每 id 一个 pane，只有正在呈现且页面可见的 pane 可请求有次数限制的 replacement。详见 [terminal.md](terminal.md)。

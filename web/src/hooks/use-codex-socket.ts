@@ -7,27 +7,25 @@ import { useQueryClient } from '@tanstack/react-query';
 import { getSocket } from '../socket';
 import { useConnectionStore } from '../stores/connection-store';
 import { useTimelineStore } from '../stores/timeline-store';
-import { showSnackbar } from '@/stores/snackbar-store';
 import { handleNotification, type NotificationContext } from './notification-handlers';
-import { tokenUsageReadThreadTokenUsage, turnDiffReadThreadTurnDiffs, turnErrorsReadThreadTurnErrors, threadsResumeThread } from '@/generated/api/sdk.gen';
 import { parseApprovalRequest } from '@/lib/approval-parsers';
-import { recoverThreadAfterReconnect, supersedeRecovery } from '@/lib/thread-recovery';
-import { nextObservationSeq } from '@/lib/turn-item-merge';
-import { forgetThreadPolicy, refreshThreadPolicy, settleIfObserved } from '@/stores/thread-policy-store';
+import { invalidateThreadEpoch } from '@/lib/thread-recovery-epoch';
+import { restoreThread } from '@/lib/thread-restore';
+import { recoverThreadAfterReconnect } from '@/lib/thread-recovery';
+import { forgetThreadPolicy } from '@/stores/thread-policy-store';
 import { userInputFromSocket } from '@/lib/user-input-parsers';
-import { syncPendingApprovals } from '@/lib/pending-approvals-sync';
-import { applyOpenResponse } from './use-thread-open';
+import { syncPendingApprovals, retirePendingRequest } from '@/lib/pending-approvals-sync';
+import { ingestAttention } from '@/lib/attention-ingestion';
+import { invalidateThreadListSoon, invalidateThreadDetails, queryHasId } from '@/lib/query-invalidation';
 import i18n from '@/i18n';
+import type { InteractionPresentationDto, PendingRequestResolvedDto } from '@/generated/api';
+import { ingestRequestFailure } from '@/lib/server-request-failures';
 
 type CodexLifecycleEvent =
   | { type: 'appServerRestarting'; generation: number; delayMs: number }
   | { type: 'appServerUnavailable'; generation: number; message: string }
   | { type: 'appServerReady'; generation: number; restarted: boolean }
   | { type: 'autoResumeCompleted'; generation: number; resumedThreadIds: string[]; failedThreadIds: string[] };
-
-function dispatchJumpToThread(threadId: string): void {
-  window.dispatchEvent(new CustomEvent('codex-webui:jump-thread', { detail: { threadId } }));
-}
 
 export function useCodexSocket(enabled = true) {
   const setConnected = useConnectionStore((s) => s.setConnected);
@@ -38,35 +36,45 @@ export function useCodexSocket(enabled = true) {
 
     const socket = getSocket();
 
-    // The first `connect` needs no repair: nothing has been missed yet, and the
-    // open path recovers the running turn on its own. Only a genuine reconnect
-    // implies a window in which notifications were dropped.
-    let hasConnectedBefore = false;
+    // A hint arriving during a read requires one trailing read. Joining the
+    // in-flight request alone could lose a transition served after its snapshot.
+    const pendingAbort = new AbortController();
+    let pendingRunning = false;
+    let pendingDirty = false;
+    let pendingTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshPending = () => {
+      pendingDirty = true;
+      if (pendingRunning || pendingTimer || pendingAbort.signal.aborted) return;
+      pendingTimer = setTimeout(() => {
+        pendingTimer = undefined;
+        pendingRunning = true;
+        void (async () => {
+          try {
+            while (pendingDirty && !pendingAbort.signal.aborted) {
+              pendingDirty = false;
+              await syncPendingApprovals(undefined, pendingAbort.signal, queryClient);
+            }
+          } finally { pendingRunning = false; }
+        })();
+      }, 0);
+    };
+    const refreshOverview = () => invalidateThreadListSoon(queryClient);
     const handleConnect = () => {
       setConnected(true);
       const store = useTimelineStore.getState();
-      store.resubscribeAll();
-      if (hasConnectedBefore) {
-        // Socket.IO guarantees ordering, not replay of events sent while this
-        // client was away, so every subscribed conversation has to re-read the
-        // durable history for the turns that could have moved during the gap.
-        for (const threadId of store.subscribedThreadIds) {
-          recoverThreadAfterReconnect(threadId);
-          // The security policy has the same gap and no other repair path: its
-          // only live source is `thread/settings/updated`, so a change made by
-          // the CLI or another tab during the outage would otherwise leave the
-          // badge asserting a policy the conversation is no longer under.
-          void refreshThreadPolicy(threadId).then(() =>
-            settleIfObserved(threadId),
-          );
+      // Also repair the first connection: the route's HTTP open may have
+      // finished before the socket joined. The room acknowledgement precedes
+      // this read, including after reconnect (Socket.IO provides no replay).
+      store.resubscribeAll((threadId) => {
+        if (!pendingAbort.signal.aborted && useTimelineStore.getState().subscribedThreadIds.has(threadId)) {
+          invalidateThreadDetails(queryClient, threadId);
+          void restoreThread(threadId, 'reconnect');
         }
-        // Approvals reach this client only as socket events, so the gap loses
-        // both halves of their lifecycle: one raised while away never appears,
-        // and one answered on another device is never cleared.
-        void syncPendingApprovals(store.subscribedThreadIds);
-      }
-      hasConnectedBefore = true;
+      });
+      refreshPending();
+      refreshOverview();
     };
+    const handleFocus = () => { refreshPending(); refreshOverview(); };
     const handleDisconnect = () => setConnected(false);
 
     socket.on('connect', handleConnect);
@@ -84,13 +92,13 @@ export function useCodexSocket(enabled = true) {
         // destroyed conversation leaves behind an observation and a running
         // confirmation timer.
         for (const threadId of threadIds) {
-          supersedeRecovery(threadId);
+          invalidateThreadEpoch(threadId);
           forgetThreadPolicy(threadId);
         }
         useTimelineStore.getState().forgetThreads(threadIds);
       },
       markThreadDeletedRemotely: (threadId, message) => {
-        supersedeRecovery(threadId);
+        invalidateThreadEpoch(threadId);
         forgetThreadPolicy(threadId);
         useTimelineStore.getState().markThreadDeletedRemotely(threadId, message);
       },
@@ -114,9 +122,9 @@ export function useCodexSocket(enabled = true) {
         const threadId = ctx.threadId;
         if (threadId) useTimelineStore.getState().appendPlanDeltaForThread(threadId, turnId, itemId, delta);
       },
-      setLoading: (loading) => {
+      setTurnStartPending: (loading) => {
         const threadId = ctx.threadId;
-        if (threadId) useTimelineStore.getState().setLoadingForThread(threadId, loading);
+        if (threadId) useTimelineStore.getState().setTurnStartPendingForThread(threadId, loading);
       },
       expandReasoning: (itemId) => {
         const threadId = ctx.threadId;
@@ -190,7 +198,13 @@ export function useCodexSocket(enabled = true) {
       },
       resolveApprovalByRequestId: (requestId) => {
         const threadId = ctx.threadId;
-        if (threadId) useTimelineStore.getState().resolveApprovalByRequestIdForThread(threadId, requestId);
+        if (!threadId) return;
+        const store = useTimelineStore.getState();
+        const runtime = store.getThreadRuntime(threadId);
+        const request = runtime?.approvals[String(requestId)] ?? runtime?.userInputRequests[String(requestId)];
+        // The compatibility room notification has no generation. Modern cards
+        // are retired exclusively by the authenticated global envelope.
+        if (request && request.generation == null) store.resolveApprovalByRequestIdForThread(threadId, requestId);
       },
     };
 
@@ -215,11 +229,12 @@ export function useCodexSocket(enabled = true) {
       }
 
       if (event.type === 'appServerRestarting') {
+        void queryClient.cancelQueries({ predicate: (query) => queryHasId(query, 'threadsListTurnItems') });
+        for (const threadId of Object.keys(store.threadsById)) invalidateThreadEpoch(threadId);
         for (const threadId of liveThreadIds) {
           // Any recovery still in flight was baselined against the old process
           // generation. Its response must not be applied on top of whatever the
           // restarted server reports.
-          supersedeRecovery(threadId);
           store.clearActiveTurnForThread(threadId);
           store.setThreadStatusForThread(threadId, { type: 'systemError' });
           store.addSystemMessageForThread(
@@ -231,12 +246,15 @@ export function useCodexSocket(enabled = true) {
       }
 
       if (event.type === 'appServerReady') {
+        // Includes visible completed owners omitted from autoResumeCompleted's
+        // target list. Their item reads are passive and need no writer resume.
         void queryClient.invalidateQueries();
+        if (store.threadId && store.getThreadRuntime(store.threadId)) void recoverThreadAfterReconnect(store.threadId);
       }
 
       if (event.type !== 'autoResumeCompleted') return;
 
-      for (const threadId of event.failedThreadIds) {
+      for (const threadId of event.failedThreadIds.filter((id) => store.subscribedThreadIds.has(id))) {
         store.addSystemMessageForThread(
           threadId,
           i18n.t('Auto-resume failed. Reopen this thread to retry.'),
@@ -244,96 +262,116 @@ export function useCodexSocket(enabled = true) {
         );
       }
 
-      for (const threadId of event.resumedThreadIds) {
+      for (const threadId of event.resumedThreadIds.filter((id) => store.subscribedThreadIds.has(id))) {
         store.addSystemMessageForThread(
           threadId,
           i18n.t('Thread resumed after app-server restart.'),
           'info',
         );
-        // Restore full thread state via deduped resume, then hydrate dependent data sequentially.
-        // Recovery after an app-server restart, not a user opening anything:
-        // the active-branch pointer must keep naming what they last chose.
-        const openBaselineSeq = nextObservationSeq();
-        void threadsResumeThread({
-          path: { threadId },
-          query: { recordActive: false },
-        })
-          .then(async ({ data }) => {
-            if (!data) return;
-            // Shared with the route and the refresh-recovery path: the response
-            // carries a recent page of turns rather than the whole history, and
-            // three separate readings of that shape is how one of them goes stale.
-            applyOpenResponse(data, openBaselineSeq);
-            // Hydrate after timeline is in place to avoid race.
-            const [tokenRes, diffRes, errorRes] = await Promise.allSettled([
-              tokenUsageReadThreadTokenUsage({ path: { threadId } }),
-              turnDiffReadThreadTurnDiffs({ path: { threadId } }),
-              turnErrorsReadThreadTurnErrors({ path: { threadId } }),
-            ]);
-            if (tokenRes.status === 'fulfilled' && tokenRes.value.data) {
-              store.hydrateTokenUsageForThread(threadId, tokenRes.value.data.turns);
-            }
-            if (diffRes.status === 'fulfilled' && diffRes.value.data) {
-              store.hydrateTurnDiffsForThread(threadId, diffRes.value.data.turns);
-            }
-            if (errorRes.status === 'fulfilled' && errorRes.value.data) {
-              store.hydrateTurnErrorsForThread(threadId, errorRes.value.data.errors);
-            }
-          })
-          .catch(() =>
-            store.addSystemMessageForThread(
-              threadId,
-              i18n.t('State recovery failed after resume.'),
-              'warning',
-            ),
-          );
+        // The backend already owns execution reattachment. Only this viewed
+        // transcript needs browser hydration; background ids create no runtimes.
+        void restoreThread(threadId, 'appServerRestart').catch(() =>
+          store.addSystemMessageForThread(
+            threadId,
+            i18n.t('State recovery failed after resume.'),
+            'warning',
+          ),
+        );
       }
     };
 
     socket.on('codex.lifecycle', handleCodexLifecycle);
 
+    /**
+     * Ingests one human request delivered to every authenticated browser.
+     *
+     * Room membership no longer gates this: it selects who watches a
+     * transcript, not who may answer a question. So the conversation is often
+     * one this client has never opened, and the request has to carry everything
+     * needed to act on it — which is why a file approval brings its own change
+     * set rather than relying on an item stream that was never received here.
+     */
     const handleCodexServerRequest = (request: {
+      instanceId?: string;
+      presentation?: InteractionPresentationDto | null;
+      negativeOnlyReason?: string | null;
       id: number | string;
       method: string;
       params: Record<string, unknown>;
+      generation?: number;
+      reviewSubject?: unknown;
     }) => {
-      const { id, method, params } = request;
+      const { id, method, params, generation, reviewSubject, instanceId, presentation, negativeOnlyReason } = request;
       if (typeof params.threadId !== 'string') return;
-      const reqThreadId = params.threadId;
-      const store = useTimelineStore.getState();
-      const title = store.getThreadTitle(reqThreadId);
-      let snackbarMessage: string | null = null;
-
-      const approval = parseApprovalRequest({ requestId: id, method, params });
-      if (approval) {
-        store.addApprovalForThread(reqThreadId, approval);
-        snackbarMessage = i18n.t('Approval needed in {{thread}}', { thread: title });
-      }
-
+      const approval = parseApprovalRequest({
+        requestId: id, method, params, generation, reviewSubject, instanceId, presentation, negativeOnlyReason,
+      });
+      if (approval) ingestAttention(approval, queryClient);
       if (method === 'item/tool/requestUserInput') {
-        const userInputRequest = userInputFromSocket({ id, params });
-        if (userInputRequest) {
-          store.addUserInputRequestForThread(reqThreadId, userInputRequest);
-          snackbarMessage = i18n.t('Input needed in {{thread}}', { thread: title });
-        }
-      }
-
-      if (snackbarMessage && store.threadId !== reqThreadId) {
-        showSnackbar(snackbarMessage, 'warning', 0, {
-          label: i18n.t('Open thread'),
-          onClick: () => dispatchJumpToThread(reqThreadId),
-        });
+        const userInput = userInputFromSocket({ id, params, generation, instanceId });
+        if (userInput) ingestAttention(userInput, queryClient);
       }
     };
 
     socket.on('codex.serverRequest', handleCodexServerRequest);
+    socket.on('codex.serverRequestFailed', ingestRequestFailure);
+
+    /**
+     * Retires a request that can no longer be answered, wherever it was
+     * answered and whatever the outcome.
+     *
+     * Broadcasting creation without broadcasting its end would leave every
+     * browser that did not answer holding a live card for a dead request. The
+     * status stays deliberately neutral: `resolved` here also covers app-server
+     * resolving it during lifecycle cleanup, so it never implies acceptance.
+     */
+    const handlePendingResolved = (event: PendingRequestResolvedDto) => {
+      retirePendingRequest(event);
+    };
+
+    socket.on('conversation.pending.resolved', handlePendingResolved);
+
+    /**
+     * Refreshes the shared conversation projection.
+     *
+     * Content-free by design: the signal says the backend's shared view moved,
+     * not how. Ordering, badges and freshness all come from re-reading it, and
+     * the shared debounced invalidator keeps one burst of changes to one
+     * refetch rather than one per event.
+     */
+    const handleOverviewChanged = refreshOverview;
+
+    /**
+     * Re-reads the pending set after the backend says it moved.
+     *
+     * This is what covers the transitions no per-request event can: a guard
+     * release republishing what a deletion withheld, and the expiry sweep. The
+     * read is idempotent and refuses to resolve anything it cannot prove, so
+     * running it more often than strictly necessary is safe.
+     */
+    const handlePendingChanged = refreshPending;
+
+    socket.on('conversation.overview.changed', handleOverviewChanged);
+    socket.on('conversation.pending.changed', handlePendingChanged);
+
+    window.addEventListener('focus', handleFocus);
+    refreshPending();
+    refreshOverview();
+    if (socket.connected) handleConnect();
 
     return () => {
+      pendingAbort.abort();
+      clearTimeout(pendingTimer);
+      window.removeEventListener('focus', handleFocus);
       socket.off('connect', handleConnect);
       socket.off('disconnect', handleDisconnect);
       socket.off('codex.notification', handleCodexNotification);
       socket.off('codex.lifecycle', handleCodexLifecycle);
       socket.off('codex.serverRequest', handleCodexServerRequest);
+      socket.off('codex.serverRequestFailed', ingestRequestFailure);
+      socket.off('conversation.pending.resolved', handlePendingResolved);
+      socket.off('conversation.overview.changed', handleOverviewChanged);
+      socket.off('conversation.pending.changed', handlePendingChanged);
     };
   }, [enabled, setConnected, queryClient]);
 }

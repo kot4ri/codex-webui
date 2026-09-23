@@ -4,8 +4,7 @@ import { CheckCircle, Loader2, MessageCircleQuestion } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { pendingApprovalsRespond } from '@/generated/api/sdk.gen';
-import { useTimelineStore } from '@/stores/timeline-store';
+import { useRequestResponse } from '@/hooks/use-request-response';
 import type { UserInputQuestion, UserInputRequest } from '@/types/approval';
 import { cn } from '@/lib/utils';
 
@@ -58,9 +57,8 @@ function isComplete(questions: UserInputQuestion[], draft: DraftState): boolean 
 
 export function UserInputCard({ request }: Props) {
   const { t } = useTranslation();
-  const resolveUserInputRequest = useTimelineStore((s) => s.resolveUserInputRequest);
+  const { send, submitting } = useRequestResponse(request);
   const [draft, setDraft] = useState<DraftState>(() => createDraft(request.questions));
-  const [submitting, setSubmitting] = useState(false);
 
   const isPending = request.status === 'pending';
   const answers = useMemo(
@@ -94,15 +92,7 @@ export function UserInputCard({ request }: Props) {
   };
 
   const handleSubmit = () => {
-    if (!canSubmit) return;
-    setSubmitting(true);
-    void pendingApprovalsRespond({
-      path: { requestId: String(request.requestId) },
-      body: { result: { answers } },
-    })
-      .then(() => resolveUserInputRequest(request.requestId))
-      .catch(() => undefined)
-      .finally(() => setSubmitting(false));
+    if (canSubmit) send({ answers });
   };
 
   return (
@@ -125,7 +115,7 @@ export function UserInputCard({ request }: Props) {
         <span className="font-medium">{t('Input Requested')}</span>
         {!isPending && (
           <span className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
-            <CheckCircle className="h-3 w-3" /> {t('Resolved')}
+            <CheckCircle className="h-3 w-3" /> {t(request.status === 'submitted' ? 'Decision submitted' : request.status === 'failed' ? 'Delivery unconfirmed' : 'Resolved')}
           </span>
         )}
       </div>

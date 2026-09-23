@@ -8,6 +8,25 @@ import {
   uniqueIndex,
 } from 'drizzle-orm/sqlite-core';
 
+/** Durable terminal intent survives disposal of its PTY and headless buffer. */
+export const terminalIdentities = sqliteTable('terminal_identities', {
+  id: text('id').primaryKey(),
+  contextKey: text('context_key').notNull(),
+  cwd: text('cwd').notNull(),
+  shell: text('shell').notNull(),
+  title: text('title').notNull(),
+  sessionId: text('session_id').notNull(),
+  generation: integer('generation').notNull(),
+  closed: integer('closed', { mode: 'boolean' }).notNull().default(false),
+  /** At most three automatic attempts in the rolling recovery window. */
+  automaticAttempts: text('automatic_attempts', { mode: 'json' })
+    .$type<number[]>()
+    .notNull(),
+  createdAt: text('created_at').notNull(),
+});
+
+export type TerminalIdentity = typeof terminalIdentities.$inferSelect;
+
 export const tokenUsageSnapshots = sqliteTable(
   'token_usage_snapshots',
   {
@@ -79,6 +98,8 @@ export type InsertSettingRow = typeof settings.$inferInsert;
 export const pendingServerRequests = sqliteTable(
   'pending_server_requests',
   {
+    // Legacy history has no instance identity and is expired at startup.
+    instanceId: text('instance_id'),
     generation: integer('generation').notNull(),
     requestId: text('request_id').notNull(),
     threadId: text('thread_id').notNull(),
@@ -91,9 +112,11 @@ export const pendingServerRequests = sqliteTable(
     createdAt: integer('created_at').notNull(),
     updatedAt: integer('updated_at').notNull(),
     resolvedAt: integer('resolved_at'),
+    failureReason: text('failure_reason'),
   },
   (table) => [
-    primaryKey({ columns: [table.generation, table.requestId] }),
+    primaryKey({ columns: [table.instanceId] }),
+    index('idx_pending_requests_origin').on(table.generation, table.requestId),
     index('idx_pending_requests_thread_status').on(
       table.threadId,
       table.status,

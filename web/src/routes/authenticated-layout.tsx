@@ -12,6 +12,7 @@ import {
   SheetContent,
   SheetTitle,
 } from '@/components/ui/sheet';
+import { TerminalHost } from '@/components/terminal/terminal-host';
 import { ChatHeader } from '@/components/chat/chat-header';
 import { ThreadSidebar } from '@/components/chat/thread-sidebar';
 import { SnackbarContainer } from '@/components/snackbar/snackbar-container';
@@ -24,18 +25,19 @@ import { useTimelineStore } from '@/stores/timeline-store';
 import { useThemeStore } from '@/stores/theme-store';
 import { cn } from '@/lib/utils';
 import { clearApiToken } from '@/auth-token';
-import { getSocket, resetSocket } from '@/socket';
+import { resetSocket } from '@/socket';
 import { filesGetRoots, filesAddRoot } from '@/generated/api';
-import {
-  settingsListSettings,
-  threadsListLoadedThreads,
-  threadsResumeThread,
-} from '@/generated/api/sdk.gen';
+import { settingsListSettings } from '@/generated/api/sdk.gen';
 import { settingsListSettingsQueryKey } from '@/generated/api/@tanstack/react-query.gen';
-import { syncPendingApprovals } from '@/lib/pending-approvals-sync';
-import { applyOpenResponse } from '@/hooks/use-thread-open';
-import { nextObservationSeq } from '@/lib/turn-item-merge';
 
+/**
+ * Bound on retained per-conversation state.
+ *
+ * Named for subscriptions historically, and it still unsubscribes what it
+ * evicts, but with rooms following the visible transcript there is rarely more
+ * than one. What it actually bounds now is the runtime cache — including the
+ * conversations attention delivery creates state for without ever opening.
+ */
 const MAX_IDLE_SUBSCRIPTIONS_KEY = 'general.maxIdleSubscriptions';
 const DEFAULT_MAX_IDLE_SUBSCRIPTIONS = 30;
 const IDLE_SUBSCRIPTION_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
@@ -56,14 +58,6 @@ export function AuthenticatedLayout() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const [homeDir, setHomeDir] = useState<string | null>(null);
 
-  const threadCwd = useTimelineStore((s) => s.threadCwd);
-  const ensureThreadState = useTimelineStore((s) => s.ensureThreadState);
-  const hydrateTimelineForThread = useTimelineStore((s) => s.hydrateTimelineForThread);
-  const setLoadingForThread = useTimelineStore((s) => s.setLoadingForThread);
-  const setThreadStatusForThread = useTimelineStore((s) => s.setThreadStatusForThread);
-  const setActiveTurnIdForThread = useTimelineStore((s) => s.setActiveTurnIdForThread);
-  const setThreadTitleForThread = useTimelineStore((s) => s.setThreadTitleForThread);
-  const setActiveThread = useTimelineStore((s) => s.setActiveThread);
   const setMaxIdleSubscriptions = useTimelineStore((s) => s.setMaxIdleSubscriptions);
   const cleanupIdleThreadSubscriptions = useTimelineStore((s) => s.cleanupIdleThreadSubscriptions);
   const setRootDir = useFilesStore((s) => s.setRootDir);
@@ -104,92 +98,16 @@ export function AuthenticatedLayout() {
       .catch(() => undefined);
   }, []);
 
-  // Discover loaded threads and hydrate pending approvals on mount.
-  useEffect(() => {
-    let cancelled = false;
-    const socket = getSocket();
-
-    // 1. Discover loaded threads from app-server memory and subscribe them.
-    const discoverLoadedThreads = async () => {
-      const seen = new Set<string>();
-      let cursor: string | undefined;
-
-      // Paginate up to 3 pages (600 threads max — more than enough for a single user).
-      for (let page = 0; page < 3; page += 1) {
-        const { data } = await threadsListLoadedThreads({
-          query: { limit: 200, ...(cursor ? { cursor } : {}) },
-        });
-        if (cancelled || !data) return;
-
-        for (const tid of data.data) {
-          if (seen.has(tid)) continue;
-          seen.add(tid);
-
-          ensureThreadState({ threadId: tid });
-          setLoadingForThread(tid, true);
-          socket.emit('thread.subscribe', { threadId: tid });
-          useTimelineStore.setState((s) => ({
-            subscribedThreadIds: new Set(s.subscribedThreadIds).add(tid),
-          }));
-
-          // Reopen to restore state. Backend dedup makes this safe, and the
-          // shared applier is what keeps this path in step with the route's:
-          // the response carries a recent page of turns, not a whole history.
-          // `recordActive: false` — nobody opened these, the page was reloaded.
-          // Letting a bulk restore write the active-branch pointer would leave
-          // each tree naming whichever member happened to be restored last.
-          const openBaselineSeq = nextObservationSeq();
-          void threadsResumeThread({
-            path: { threadId: tid },
-            query: { recordActive: false },
-          })
-            .then(({ data: resumeData }) => {
-              if (cancelled || !resumeData) return;
-              applyOpenResponse(resumeData, openBaselineSeq);
-            })
-            .catch(() => {
-              if (!cancelled) setLoadingForThread(tid, false);
-            });
-        }
-
-        if (!data.nextCursor) break;
-        cursor = data.nextCursor;
-      }
-    };
-    void discoverLoadedThreads().catch(() => undefined);
-
-    // 2. Hydrate pending approvals and user input requests. Shared with the
-    // reconnect path, which has the same gap for the opposite reason: here
-    // nothing is known yet, there everything known may have moved on.
-    // Tied to this effect's lifetime: a response landing after logout would
-    // otherwise repopulate approvals for a session that is gone.
-    const pendingReadAbort = new AbortController();
-    void syncPendingApprovals(undefined, pendingReadAbort.signal);
-
-    return () => {
-      cancelled = true;
-      pendingReadAbort.abort();
-    };
-  }, [
-    ensureThreadState,
-    hydrateTimelineForThread,
-    setActiveTurnIdForThread,
-    setLoadingForThread,
-    setThreadStatusForThread,
-    setThreadTitleForThread,
-  ]);
-
   // Handle snackbar jump-to-thread actions.
   useEffect(() => {
     const handleJump = (event: Event) => {
       const threadId = (event as CustomEvent<{ threadId?: string }>).detail?.threadId;
       if (!threadId) return;
-      setActiveThread(threadId);
       void navigate({ to: '/t/$threadId', params: { threadId } });
     };
     window.addEventListener('codex-webui:jump-thread', handleJump);
     return () => window.removeEventListener('codex-webui:jump-thread', handleJump);
-  }, [navigate, setActiveThread]);
+  }, [navigate]);
 
   // Handle auth expiry → redirect to /login
   useEffect(() => {
@@ -202,21 +120,31 @@ export function AuthenticatedLayout() {
     return () => window.removeEventListener('codex-webui:auth-expired', handleAuthExpired);
   }, [navigate]);
 
-  // Sync file tree root based on current route context
+  // Conversation roots are adopted by their keyed WorkspaceTree. This owner
+  // handles the standalone browser only, so late metadata cannot reset browsing.
   useEffect(() => {
+    let cancelled = false;
     const dir = pathname.startsWith('/files')
       ? homeDir
-      : pathname.startsWith('/t/')
-        ? threadCwd
-        : null;
+      : null;
+    // `setRootDir` resets the expansion set and the selection, so it must only
+    // be reached when the root genuinely changes — navigating between two
+    // conversations that share a working directory would otherwise collapse
+    // the whole tree on every hop. The store's own equality guard does the
+    // rest; clearing first would defeat it.
     if (dir) {
+      // A rejected root is still shown: the tree reports the directory it
+      // cannot read, instead of silently leaving the previous one on screen.
       void filesAddRoot({ body: { root: dir }, throwOnError: true, meta: { silent: true } })
-        .then(() => setRootDir(dir))
-        .catch(() => { /* root rejected */ });
-    } else {
+        .then(() => { if (!cancelled) setRootDir(dir); })
+        .catch(() => { if (!cancelled) setRootDir(dir); });
+    } else if (!pathname.startsWith('/t/')) {
       setRootDir(null);
     }
-  }, [pathname, threadCwd, homeDir, setRootDir]);
+    // Retain the tree cache when entering a conversation; its keyed explorer
+    // withholds presentation until its own cwd adoption completes.
+    return () => { cancelled = true; };
+  }, [pathname, homeDir, setRootDir]);
 
   const { t } = useTranslation();
   const handleToggleDiagnostics = useCallback(() => {
@@ -268,15 +196,16 @@ export function AuthenticatedLayout() {
         )}
 
         <div className="flex min-h-0 min-w-0 flex-1 flex-col isolate">
-          <ChatHeader
+          {!pathname.startsWith('/t/') && <ChatHeader
             dark={dark}
             onToggleDark={toggleDark}
             onToggleDiagnostics={handleToggleDiagnostics}
-          />
+          />}
           <CodexStatusBanner />
           <Outlet />
         </div>
       </div>
+      <TerminalHost />
       <SnackbarContainer />
     </TooltipProvider>
   );

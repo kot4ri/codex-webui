@@ -17,12 +17,12 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
-import { pendingApprovalsRespond } from '@/generated/api/sdk.gen';
-import { useTimelineStore } from '@/stores/timeline-store';
 import type { TurnItem } from '@/types/timeline';
-import type { ApprovalRequest, ResolvableApprovalDecision } from '@/types/approval';
+import type { ApprovalRequest } from '@/types/approval';
 import { cn } from '@/lib/utils';
-import { GitDiffPanel } from './git-diff-panel';
+import { summarizeChangeSet } from '@/lib/file-change-stats';
+import { FileChangeSet } from './file-change-set';
+import { useApprovalDecision } from '@/hooks/use-approval-decision';
 
 interface Props {
   item: Extract<TurnItem, { type: 'fileChange' }>;
@@ -30,45 +30,33 @@ interface Props {
   approval?: ApprovalRequest;
 }
 
-/** Maps UI decision to Codex JSON-RPC decision value. */
-function toRpcDecision(decision: ResolvableApprovalDecision): string {
-  switch (decision) {
-    case 'accepted': return 'accept';
-    case 'acceptedForSession': return 'acceptForSession';
-    case 'declined': return 'decline';
-    case 'cancelled': return 'cancel';
-  }
-}
-
 export function FileChangeItem({ item, approval }: Props) {
   const { t } = useTranslation();
-  const resolveApproval = useTimelineStore((s) => s.resolveApproval);
+  const { decide: handleDecision, submitting } = useApprovalDecision(approval);
   const [expanded, setExpanded] = useState(false);
 
-  const fileName = item.filePath?.split('/').pop() ?? t('File change');
-  const diff = item.fileDiff ?? '';
-  const lines = diff ? diff.split('\n') : [];
-  const additions = lines.filter(
-    (l) => l.startsWith('+') && !l.startsWith('+++'),
-  ).length;
-  const deletions = lines.filter(
-    (l) => l.startsWith('-') && !l.startsWith('---'),
-  ).length;
+  // One approval can cover several files (measured). Fall back to the legacy
+  // single-file fields so an item normalized before this existed still renders.
+  const changes = approval?.reviewChanges?.length
+    ? approval.reviewChanges
+    : item.fileChanges?.length
+      ? item.fileChanges
+      : item.filePath
+        ? [{ path: item.filePath, diff: item.fileDiff ?? '' }]
+        : [];
+  const fileName = changes[0]?.path.split('/').pop() ?? t('File change');
+  const { additions, deletions, hasDiff } = summarizeChangeSet(changes);
 
   const isPending = approval?.status === 'pending';
+  // The backend refuses to accept a file approval it could not retain the
+  // change set for, even when this client happens to be showing the item. Its
+  // rule is about what the *decision* is made against, not what one browser can
+  // see, so the inline bar has to honour it too or offer a button that 409s.
+  const canApprove = !(approval && !approval.reviewChanges?.length);
   const isDeclined = approval?.status === 'declined';
   const isCancelled = approval?.status === 'cancelled';
   const isResolved = approval?.status === 'resolved';
 
-  const handleDecision = (decision: ResolvableApprovalDecision) => {
-    if (!approval) return;
-    void pendingApprovalsRespond({
-      path: { requestId: String(approval.requestId) },
-      body: { result: { decision: toRpcDecision(decision) } },
-    })
-      .then(() => resolveApproval(approval.requestId, decision))
-      .catch(() => undefined);
-  };
 
   return (
     <div
@@ -87,11 +75,13 @@ export function FileChangeItem({ item, approval }: Props) {
       >
         <FileCode className="h-3.5 w-3.5 shrink-0 text-orange-400" />
         <span className="min-w-0 truncate font-mono text-muted-foreground">
-          {item.filePath ?? fileName}
+          {changes.length > 1
+            ? t('{{count}} files', { count: changes.length })
+            : (changes[0]?.path ?? fileName)}
         </span>
 
         {/* +/- stats */}
-        {diff && (
+        {hasDiff && (
           <>
             {additions > 0 && (
               <span className="shrink-0 text-green-400">+{additions}</span>
@@ -165,26 +155,38 @@ export function FileChangeItem({ item, approval }: Props) {
               <code className="rounded bg-muted px-1">{approval.grantRoot}</code>
             </span>
           )}
+          {!canApprove && (
+            <span className="text-xs text-amber-500">
+              {t('Changes unavailable — decline only')}
+            </span>
+          )}
           <div className="ml-auto flex flex-wrap justify-end gap-1.5">
+            {canApprove && (
+              <>
+                <Button
+                  disabled={submitting}
+                  size="sm"
+                  variant="outline"
+                  className="h-6 border-green-500/50 px-2 text-xs text-green-500 hover:bg-green-500/10"
+                  onClick={(e) => { e.stopPropagation(); handleDecision('accepted'); }}
+                >
+                  <Check className="mr-1 h-3 w-3" />
+                  {t('Accept')}
+                </Button>
+                <Button
+                  disabled={submitting}
+                  size="sm"
+                  variant="outline"
+                  className="h-6 border-green-500/30 px-2 text-xs text-green-600 hover:bg-green-500/10"
+                  onClick={(e) => { e.stopPropagation(); handleDecision('acceptedForSession'); }}
+                >
+                  <CheckCheck className="mr-1 h-3 w-3" />
+                  {t('Accept for session')}
+                </Button>
+              </>
+            )}
             <Button
-              size="sm"
-              variant="outline"
-              className="h-6 border-green-500/50 px-2 text-xs text-green-500 hover:bg-green-500/10"
-              onClick={(e) => { e.stopPropagation(); handleDecision('accepted'); }}
-            >
-              <Check className="mr-1 h-3 w-3" />
-              {t('Accept')}
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-6 border-green-500/30 px-2 text-xs text-green-600 hover:bg-green-500/10"
-              onClick={(e) => { e.stopPropagation(); handleDecision('acceptedForSession'); }}
-            >
-              <CheckCheck className="mr-1 h-3 w-3" />
-              {t('Accept for session')}
-            </Button>
-            <Button
+              disabled={submitting}
               size="sm"
               variant="outline"
               className="h-6 border-red-500/50 px-2 text-xs text-red-500 hover:bg-red-500/10"
@@ -194,6 +196,7 @@ export function FileChangeItem({ item, approval }: Props) {
               {t('Decline')}
             </Button>
             <Button
+              disabled={submitting}
               size="sm"
               variant="outline"
               className="h-6 border-orange-500/50 px-2 text-xs text-orange-500 hover:bg-orange-500/10"
@@ -206,41 +209,8 @@ export function FileChangeItem({ item, approval }: Props) {
         </div>
       )}
 
-      {/* Collapsible diff body */}
-      {expanded && diff && (
-        item.completed ? (
-          <GitDiffPanel
-            diff={diff}
-            filePath={item.filePath ?? fileName}
-            showToolbar={false}
-            maxHeightClassName="max-h-64"
-          />
-        ) : (
-          <pre
-            className={cn(
-              'max-h-64 overflow-auto border-t border-border p-3 font-mono text-xs leading-relaxed',
-              'scrollbar-thin scrollbar-track-transparent scrollbar-thumb-muted-foreground/20',
-            )}
-          >
-            {lines.map((line, i) => (
-              <div
-                key={i}
-                className={cn(
-                  line.startsWith('+') && !line.startsWith('+++')
-                    ? 'bg-green-500/10 text-green-400'
-                    : line.startsWith('-') && !line.startsWith('---')
-                      ? 'bg-red-500/10 text-red-400'
-                      : line.startsWith('@@')
-                        ? 'text-blue-400'
-                        : 'text-muted-foreground',
-                )}
-              >
-                {line}
-              </div>
-            ))}
-          </pre>
-        )
-      )}
+      {/* Collapsible diff body — every proposed file, not just the first */}
+      {expanded && <FileChangeSet changes={changes} settled={Boolean(approval?.reviewChanges?.length) || item.completed} alwaysLabelPaths />}
     </div>
   );
 }

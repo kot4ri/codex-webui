@@ -1,12 +1,12 @@
 /** Multi-tab terminal workspace for global and thread contexts. */
 import { useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { TerminalPane } from '@/components/terminal/terminal-pane';
+import { TerminalSurface } from '@/components/terminal/terminal-host';
 import { TerminalStatusBar } from '@/components/terminal/terminal-status-bar';
 import { TerminalTabs } from '@/components/terminal/terminal-tabs';
-import { useTerminalSocketEvents } from '@/hooks/use-terminal-socket';
 import { useTerminalStore } from '@/stores/terminal-store';
 import { cn } from '@/lib/utils';
+import { useTerminalDiscovery } from '@/hooks/use-terminal-discovery';
 
 interface Props {
   contextKey: string;
@@ -16,22 +16,20 @@ interface Props {
 
 export function TerminalWorkspace({ contextKey, cwd, className }: Props) {
   const { t } = useTranslation();
-  useTerminalSocketEvents();
   const context = useTerminalStore((s) => s.contexts[contextKey]);
-  const ensureContext = useTerminalStore((s) => s.ensureContext);
+  useTerminalDiscovery(contextKey);
   const selectTerminal = useTerminalStore((s) => s.selectTerminal);
 
   const terminalIds = useMemo(() => context?.terminalIds ?? [], [context?.terminalIds]);
-  const activeTerminalId = context?.activeTerminalId ?? terminalIds[0] ?? null;
+  const activeTerminalId = context?.activeTerminalId ?? null;
 
+  // Discovery must not move an existing selection, but this surface *is* the
+  // terminal: with nothing selected at all there is no intent to preserve, and
+  // landing on "Select a terminal" would be the standalone route's whole content.
+  // Conversation tabs never reach here — they render `TerminalSurface` directly.
   useEffect(() => {
-    void ensureContext(contextKey, cwd, true);
-  }, [contextKey, cwd, ensureContext]);
-
-  useEffect(() => {
-    if (!activeTerminalId && terminalIds[0]) {
+    if (!activeTerminalId && terminalIds[0])
       selectTerminal(contextKey, terminalIds[0]);
-    }
   }, [activeTerminalId, contextKey, selectTerminal, terminalIds]);
 
   return (
@@ -52,15 +50,10 @@ export function TerminalWorkspace({ contextKey, cwd, className }: Props) {
             {t('No terminals')}
           </div>
         )}
-        {terminalIds.map((terminalId) => (
-          <TerminalPane
-            key={terminalId}
-            contextKey={contextKey}
-            terminalId={terminalId}
-            active={terminalId === activeTerminalId}
-            className="absolute inset-0"
-          />
-        ))}
+        {terminalIds.length > 0 && !activeTerminalId && (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">{t('Select a terminal')}</div>
+        )}
+        {activeTerminalId && <TerminalSurface terminalId={activeTerminalId} contextKey={contextKey} />}
       </div>
 
       <TerminalStatusBar contextKey={contextKey} activeTerminalId={activeTerminalId} />

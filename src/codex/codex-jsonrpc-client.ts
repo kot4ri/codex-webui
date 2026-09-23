@@ -14,13 +14,32 @@ import { join } from 'node:path';
 const bigintReplacer = (_key: string, value: unknown): unknown =>
   typeof value === 'bigint' ? Number(value) : value;
 
-/** Omits continuation steering and explanation text from the local wire log. */
+/** Credential field names used by login, refresh and attestation payloads. */
+const AUDIT_CREDENTIAL_KEYS = new Set([
+  'apikey',
+  'accesstoken',
+  'refreshtoken',
+  'idtoken',
+  'token',
+  'clientsecret',
+  'authorization',
+]);
+
+/**
+ * Redacts credentials recursively in both directions without changing the wire
+ * payload. Boolean flags such as account/read's refreshToken are not secrets.
+ */
 const auditLogReplacer = (key: string, value: unknown): unknown => {
   if (key === 'steer' || key === 'detailedExplanation') return '[REDACTED]';
+  if (
+    typeof value === 'string' &&
+    AUDIT_CREDENTIAL_KEYS.has(key.replaceAll('_', '').toLowerCase())
+  )
+    return '[REDACTED]';
   return bigintReplacer(key, value);
 };
 
-/** Serializes one local audit entry after removing non-loggable error detail. */
+/** Serializes an audit entry, omitting credentials and private error detail. */
 export function serializeCodexAuditEntry(
   dir: 'in' | 'out',
   msg: unknown,
@@ -39,6 +58,10 @@ import type {
 } from './codex-schema';
 import { CodexRpcError } from './codex-errors';
 import { CodexAcceptedWork } from './codex-accepted-work';
+import {
+  ServerRequestOwner,
+  type ServerRequestRetirement,
+} from './server-request-owner';
 
 /** Wire-level JSON-RPC message (jsonrpc field omitted per Codex protocol). */
 interface JsonRpcRequest {
@@ -61,6 +84,7 @@ interface JsonRpcResponse {
 type JsonRpcMessage = JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
 
 interface PendingRequest {
+  observationSequence: number;
   method: string;
   params: unknown;
   resolve: (result: unknown) => void;
@@ -69,8 +93,19 @@ interface PendingRequest {
 }
 
 export interface CodexJsonRpcClientEvents {
+  /** Successful correlated responses, observed before the caller is resolved. */
+  response: [
+    {
+      method: string;
+      params: unknown;
+      result: unknown;
+      requestSequence: number;
+      responseSequence: number;
+    },
+  ];
   notification: [ServerNotification];
   serverRequest: [ServerRequest];
+  serverRequestRetired: [ServerRequestRetirement];
   error: [Error];
   close: [number | null, string | null];
 }
@@ -86,10 +121,20 @@ function createJsonlStream(): WriteStream {
 }
 
 export class CodexJsonRpcClient extends EventEmitter<CodexJsonRpcClientEvents> {
+  /** Sole ingress owner; observer registration never confers response authority. */
+  readonly serverRequests = new ServerRequestOwner(
+    (message) => {
+      this.writeJsonl('out', message);
+      this.send(message);
+    },
+    (event) => this.emit('serverRequestRetired', event),
+    (message) => this.logger.error(message),
+  );
   /** Generation-local work ledger, populated only by this connection's outgoing requests. */
   readonly acceptedWork = new CodexAcceptedWork();
   private readonly logger = new Logger(CodexJsonRpcClient.name);
   private nextId = 1;
+  private observationSequence = 0;
   private readonly pending = new Map<RequestId, PendingRequest>();
   private buffer = '';
   private closed = false;
@@ -146,6 +191,7 @@ export class CodexJsonRpcClient extends EventEmitter<CodexJsonRpcClientEvents> {
       }, timeoutMs ?? this.requestTimeoutMs);
 
       this.pending.set(id, {
+        observationSequence: this.observationSequence,
         method,
         params,
         resolve: resolve,
@@ -178,42 +224,10 @@ export class CodexJsonRpcClient extends EventEmitter<CodexJsonRpcClientEvents> {
     this.send(message);
   }
 
-  /**
-   * Responds to a server-initiated request (e.g. approval requests).
-   *
-   * @param id - The request ID from the server request
-   * @param result - The response payload
-   */
-  respondToServerRequest(id: RequestId, result: unknown): void {
-    if (this.closed) {
-      throw new Error('Cannot respond: app-server client is closed');
-    }
-    const message = { id, result };
-    this.writeJsonl('out', message);
-    this.send(message);
-  }
-
-  /**
-   * Responds to a server-initiated request with an error.
-   *
-   * @param id - The request ID from the server request
-   * @param code - JSON-RPC error code
-   * @param message - Error message
-   */
-  respondToServerRequestWithError(
-    id: RequestId,
-    code: number,
-    message: string,
-  ): void {
-    if (this.closed) return;
-    const msg = { id, error: { code, message } };
-    this.writeJsonl('out', msg);
-    this.send(msg);
-  }
-
   /** Kills the underlying app-server process and closes the log stream. */
   destroy(): void {
     this.closed = true;
+    this.serverRequests.close();
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
       pending.reject(new Error('Client destroyed'));
@@ -255,6 +269,7 @@ export class CodexJsonRpcClient extends EventEmitter<CodexJsonRpcClientEvents> {
     this.process.on('close', (code, signal) => {
       this.acceptedWork.processExited();
       this.closed = true;
+      this.serverRequests.close();
       for (const [, pending] of this.pending) {
         clearTimeout(pending.timer);
         pending.reject(
@@ -287,7 +302,13 @@ export class CodexJsonRpcClient extends EventEmitter<CodexJsonRpcClientEvents> {
     }
   }
 
+  /** Current wire observation order, used to reject stale asynchronous settings evidence. */
+  getObservationSequence(): number {
+    return this.observationSequence;
+  }
+
   private handleMessage(message: JsonRpcMessage): void {
+    this.observationSequence++;
     // Response to a client-initiated request
     if ('id' in message && ('result' in message || 'error' in message)) {
       const response = message;
@@ -314,6 +335,13 @@ export class CodexJsonRpcClient extends EventEmitter<CodexJsonRpcClientEvents> {
           }),
         );
       } else {
+        this.emit('response', {
+          method: pending.method,
+          params: pending.params,
+          result: response.result,
+          requestSequence: pending.observationSequence,
+          responseSequence: this.observationSequence,
+        });
         pending.resolve(response.result);
       }
       return;
@@ -321,12 +349,14 @@ export class CodexJsonRpcClient extends EventEmitter<CodexJsonRpcClientEvents> {
 
     // Server-initiated request (has id + method, no result/error)
     if ('id' in message && 'method' in message) {
-      this.emit('serverRequest', message as unknown as ServerRequest);
+      if (this.serverRequests.receive(message))
+        this.emit('serverRequest', structuredClone(message) as ServerRequest);
       return;
     }
 
     // Server notification (has method, no id)
     if ('method' in message && !('id' in message)) {
+      this.serverRequests.observe(message.method, message.params);
       this.acceptedWork.notification(message.method, message.params);
       this.emit('notification', message as unknown as ServerNotification);
       return;

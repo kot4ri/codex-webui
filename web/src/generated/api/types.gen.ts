@@ -1395,9 +1395,29 @@ export type ThreadOverviewRowDto = {
     pendingApprovalCount: number;
 };
 
+export type ThreadMetadataFreshnessDto = {
+    /**
+     * App-server generation that supplied this collection.
+     */
+    generation: number;
+    /**
+     * Successful complete discovery time, Unix milliseconds.
+     */
+    refreshedAt: number;
+    /**
+     * True after a known change, failed refresh, expiry, or process replacement.
+     */
+    stale: boolean;
+    /**
+     * True while backend-owned discovery is in flight.
+     */
+    refreshing: boolean;
+};
+
 export type ThreadOverviewResponseDto = {
     data: Array<ThreadOverviewRowDto>;
     nextCursor: string | null;
+    freshness: ThreadMetadataFreshnessDto;
 };
 
 export type ThreadTurnsPageDto = {
@@ -1561,7 +1581,54 @@ export type ThreadDeletePlanThreadDto = {
     updatedAt?: number | null;
 };
 
+export type FileChangeApprovalSubjectDto = {
+    type: 'fileChange';
+    changes: Array<FileUpdateChangeDto>;
+};
+
+export type PermissionOptionDto = {
+    id: string;
+    label: string;
+    access: 'read' | 'write' | 'deny' | 'network';
+    required: boolean;
+};
+
+export type ElicitationOptionDto = {
+    value: string;
+    label: string;
+};
+
+export type ElicitationFieldDto = {
+    name: string;
+    title: string;
+    description: string;
+    type: 'string' | 'number' | 'integer' | 'boolean' | 'enum' | 'array';
+    required: boolean;
+    options?: Array<ElicitationOptionDto>;
+    minimum?: number;
+    maximum?: number;
+    minLength?: number;
+    maxLength?: number;
+    minItems?: number;
+    maxItems?: number;
+    format?: string;
+};
+
+export type InteractionPresentationDto = {
+    kind: 'permissions' | 'elicitation';
+    supported: boolean;
+    unsupportedReason: string | null;
+    message: string;
+    serverName: string | null;
+    cwd: string | null;
+    environmentId: string | null;
+    url: string | null;
+    permissions: Array<PermissionOptionDto>;
+    fields: Array<ElicitationFieldDto>;
+};
+
 export type PendingServerRequestDto = {
+    instanceId: string;
     generation: number;
     requestId: string;
     threadId: string;
@@ -1571,7 +1638,10 @@ export type PendingServerRequestDto = {
     params: {
         [key: string]: unknown;
     };
-    status: 'pending' | 'resolved' | 'expired' | 'failed' | 'cancelled';
+    reviewSubject: FileChangeApprovalSubjectDto | null;
+    presentation: InteractionPresentationDto | null;
+    negativeOnlyReason: string | null;
+    status: 'pending' | 'submitted' | 'resolved' | 'expired' | 'failed' | 'cancelled';
     createdAt: number;
     updatedAt: number;
 };
@@ -1731,11 +1801,32 @@ export type ThreadPolicyAcceptedDto = {
     status: 'accepted';
 };
 
+export type PendingRequestResolvedDto = {
+    instanceId: string;
+    generation: number;
+    requestId: string;
+    threadId: string;
+    status: 'submitted' | 'resolved' | 'cancelled' | 'expired' | 'failed';
+};
+
+export type ServerRequestFailureDto = {
+    instanceId: string;
+    threadId: string | null;
+    turnId: string | null;
+    message: string;
+};
+
 export type PendingServerRequestsResponseDto = {
+    generation: number;
     requests: Array<PendingServerRequestDto>;
+    failures: Array<ServerRequestFailureDto>;
 };
 
 export type RespondPendingServerRequestDto = {
+    /**
+     * Opaque identity of the exact proposal shown to the browser. Required; old clients must refresh.
+     */
+    instanceId: string;
     result: {
         [key: string]: unknown;
     };
@@ -3776,6 +3867,15 @@ export type PendingApprovalsListPendingData = {
     };
     url: '/api/pending-approvals';
 };
+
+export type PendingApprovalsListPendingErrors = {
+    /**
+     * A deletion intersects this read scope. No snapshot is returned; retry on the pending-change hint after guard release.
+     */
+    409: ApiErrorResponseDto;
+};
+
+export type PendingApprovalsListPendingError = PendingApprovalsListPendingErrors[keyof PendingApprovalsListPendingErrors];
 
 export type PendingApprovalsListPendingResponses = {
     200: PendingServerRequestsResponseDto;

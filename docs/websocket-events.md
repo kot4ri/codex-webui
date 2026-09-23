@@ -27,23 +27,29 @@ codex app-server (stdout JSONL)
 |------|---------|------|
 | `thread.subscribe` | `{ threadId }` | 加入 Socket.IO room |
 | `thread.unsubscribe` | `{ threadId }` | 离开 room |
-| `codex.serverResponse` | `{ id, result }` | 回复审批等 server request |
+| `codex.serverResponse` | `{ id, instanceId, result }` | 必须引用原 proposal；与 REST 共用 CAS 和原连接答复 |
 | `fs.subscribe` | `{ path }` | 订阅目录变更，首次创建 chokidar watcher |
 | `fs.unsubscribe` | `{ path }` | 取消订阅，无订阅者时关闭 watcher |
-| `terminal.open` | `{ cwd, cols, rows }` | 打开 PTY session，回调返回 `{ terminalId }` |
-| `terminal.input` | `{ terminalId, data }` | 用户键盘输入 |
-| `terminal.resize` | `{ terminalId, cols, rows }` | 终端窗口大小变化 |
-| `terminal.close` | `{ terminalId }` | 关闭终端 session |
+| `terminal.open` | `{ contextKey, cwd?, cols?, rows?, title? }` | 创建逻辑终端与 PTY，ACK 返回 terminal metadata |
+| `terminal.list` | `{ contextKey }` | 仅列出现存 session，不创建 |
+| `terminal.reconnect` | `{ contextKey, terminalId }` | 仅附着；返回 terminal/state/sequence |
+| `terminal.recover` | `{ contextKey, terminalId, manual }` | 前台终端恢复；后端仲裁 durable eligibility 与滚动限额 |
+| `terminal.input` | `{ contextKey, terminalId, sessionId, data }` | 仅作用于指定物理 shell |
+| `terminal.resize` | `{ contextKey, terminalId, sessionId, cols, rows }` | 终端窗口大小变化 |
+| `terminal.close` | `{ contextKey, terminalId }` | 所有状态均持久化撤销逻辑身份；成功才确认 |
 
 ### Server → Client
 
 | 事件 | Payload | 作用 |
 |------|---------|------|
 | `codex.notification` | Codex notification（turn error 已去 steer） | 所有通知统一事件名 |
-| `codex.serverRequest` | `{ id, method, params }` | 需要前端回复的请求 |
+| `codex.serverRequest` | `{ id, instanceId, method, params, generation, reviewSubject, presentation, negativeOnlyReason }` | 完整人机交互请求，面向所有已认证浏览器 |
+| `conversation.overview.changed` | `{ generation }` | Authenticated global overview/freshness invalidation; no transcript payload |
+| `conversation.pending.changed` | `{ generation }` | Authenticated global pending-set invalidation, including expiry/cancellation |
+| `conversation.pending.resolved` | `{ instanceId, generation, requestId, threadId, status }` | 区分 submitted 与 resolved/cancelled/expired/failed，不表示执行成功 |
 | `fs.changed` | `{ event, path }` | 文件变更通知 (add/change/unlink/addDir/unlinkDir) |
-| `terminal.output` | `{ terminalId, data }` | PTY 输出 |
-| `terminal.exit` | `{ terminalId, exitCode }` | PTY 进程退出 |
+| `terminal.output` | `{ terminalId, sessionId, sequence, data }` | 与 snapshot 同序列边界的 PTY 输出 |
+| `terminal.exit` | `{ terminal, closed:false }` 或 `{ terminalId, contextKey, closed:true }` | 自然退出或明确关闭；二者不混用 |
 
 `thread/settings/updated`、`thread/goal/updated`、`thread/goal/cleared` 以及 inline review 产生的 `turn/*` / `item/*` notification 走同一个 `codex.notification` 通道，按 `params.threadId` 投递到对应 room。除上述错误投影外，后端不改写事件。
 
@@ -77,7 +83,7 @@ codex app-server (stdout JSONL)
 |--------|----------|
 | `error` | willRetry=true → warning toast（去重）；false → error toast + 结构化 TurnFailure upsert + 停止 loading。后续稀疏 terminal event 不会抹掉详情 |
 | `thread/tokenUsage/updated` | 存储 per-turn 用量，更新 latest（驱动 ChatInput 圆环 + turn footer）|
-| `serverRequest/resolved` | 按 requestId 校准 approval 状态为 resolved，支持乱序到达 |
+| `serverRequest/resolved` | 原连接 owner 投影为带 instance 的退休；浏览器不按裸 requestId 退休现代卡片 |
 | `configWarning` | warning toast（summary + details）|
 | `deprecationNotice` | warning toast |
 
@@ -142,12 +148,12 @@ dev 模式 `console.debug`，不静默丢弃。
 | `item/fileChange/requestApproval` | 解析为 ApprovalRequest，渲染审批卡片 |
 | `item/tool/requestUserInput` | 解析为 UserInputRequest（EXPERIMENTAL），渲染 UserInputCard（radio/checkbox/text/password）|
 
-用户点击 Accept/Decline → `codex.serverResponse` → 后端回传 app-server。
+用户决定 → `useRequestResponse` REST（包含 instanceId）→ CAS 提交 submitted → 原 stdio 连接答复。Socket.IO 路径要求相同身份。
 
-**删除期间的抑制与重放**：thread 处于删除守卫内时，gateway 仍照常写入 SQLite（保持 `pending`），但**不广播**该 thread 的 server request，并把它暂存在内存里。守卫释放时逐条重放：只重放 DB 里仍为 `pending` 的（真正被删掉的 thread 其待审批已在本地清理阶段置为 `cancelled`）。中止的删除因此不会留下"app-server 还在等、UI 却永远看不到"的请求。详见 [approval.md](approval.md)。
+**删除期间的抑制与重放**：thread 处于删除守卫内时，ingress admission 仍照常写入 SQLite（保持 `pending`），但**不广播**该 thread 的 server request，并把它暂存在内存里。守卫释放时逐条重放：只重放 DB 里仍为 `pending` 的（真正被删掉的 thread 其待审批已在本地清理阶段置为 `cancelled`）。中止的删除因此不会留下"app-server 还在等、UI 却永远看不到"的请求。详见 [approval.md](approval.md)。
 
 用户提交 UserInputCard → `pendingApprovalsRespond` REST → 后端回传 app-server。
-`serverRequest/resolved` 通知 → 按 requestId 匹配审批/用户输入卡片 → 标记为 resolved。
+`serverRequest/resolved` 通知继续向 thread room 投递；全局 `conversation.pending.resolved` 独立覆盖已提交的响应、上游解决、删除取消和重启过期。客户端按 instanceId 幂等处理；submitted 只表示本地提交，resolved 不暗示用户接受或执行成功。
 
 ## Thread 切换流程（多 Thread 并发）
 
@@ -165,12 +171,12 @@ dev 模式 `console.debug`，不静默丢弃。
 ## 注意事项
 
 - 非 thread-scoped 的通知（如 error, configWarning, deprecationNotice）广播给所有连接
-- server request 发给 thread room 内的客户端；审批响应通过 REST CAS 接口，first-writer-wins
+- 已接管的人机请求发给所有已认证客户端；请求 instance 参与 REST/Socket.IO CAS，first-writer-wins
 - `useCodexSocket` 通过 `useTimelineStore.getState()` 获取最新 per-thread actions，避免 stale closure
 - notification-handlers 通过 mutable `ctx.threadId` 按 `params.threadId` 路由到对应 thread runtime
 - 生命周期事件的 thread list 失效使用 300ms debounce 防止风暴
 - 重试 error toast 按 `threadId:turnId:message` 在 5s 窗口内去重
-- `serverRequest/resolved` 可能先于 approval 到达，使用 per-thread pendingResolvedRequestIds 缓冲；approval 和 user-input 均按 requestId 定位
+- 带 instance 的全局退休可先于卡片读取到达；恢复读及本地去重按 instance 保留退休证据，裸 wire ID 不作为响应 authority
 - `subscribedThreadIds` 通过 `general.maxIdleSubscriptions` 做空闲 LRU 清理；active / loading / pending approval / pending user-input / buffered resolved-request thread 不会被清理
 
 ### Catalog activation lifecycle
@@ -186,3 +192,42 @@ subscribed conversation's security policy, and synchronizes its pending approval
 and user-input requests. These reads preserve evidence received while they are
 in flight; see [thread-policy-recovery.md](thread-policy-recovery.md) for the
 ordering rules and the remaining gap for turns completed entirely while offline.
+
+### Backend discovery and reattachment
+
+Detailed room subscriptions now affect delivery only. Backend restart targets
+come from `ThreadExecutionInventoryService`, including active goals and known
+spawned owners, even with no browsers connected. `autoResumeCompleted` reports
+session reattachment, never automatic replay of a turn. The two global change
+signals above require authentication but no conversation-room membership. They
+are also emitted after authentication to request fresh baselines. The complete
+server contract and durability limits are in
+[conversation-recovery.md](conversation-recovery.md).
+
+Human attention now has independent authenticated-wide delivery. File approvals
+carry the full retained change set, not a replayed item stream; machine-facing
+server requests are excluded explicitly. Deletion suppression/replay includes
+the subject. Recovery reads fail with HTTP 409 while deletion intersects their
+scope so temporary suppression cannot become false resolution. Exact payloads,
+classification and client ordering rules are in
+[approval.md](approval.md#global-attention-contract).
+
+前端消费（`use-codex-socket.ts`）：`codex.serverRequest` 幂等摄入并按会话命名通知；
+`conversation.pending.resolved` 中性退休；`conversation.overview.changed` 走共享去抖失效刷新会话列表——
+这也是收窄订阅之后后台会话徽章依然鲜活的原因；`conversation.pending.changed` 合并触发全局幂等读取，
+在途期间又来提示则保留一次尾随读取，覆盖守卫释放与过期清扫这类没有单条请求事件的转换。
+房间只跟随正在看的转录，不再有启动期批量订阅。
+
+创建与恢复共用同一套通知决策，重复投递不重复提示；全局提交/退休校验 instanceId，
+清除可见/排队提示并区分 submitted、resolved 和 failed。原始 `serverRequest/resolved`
+没有 WebUI instance，不用于退休现代卡片。挂载、focus、connect 与 hint 共用同一个刷新入口，卸载时取消在途 pending 读取。
+
+## 新增交互与失败说明
+
+`item/permissions/requestApproval` 显示完整权限选项、deny 约束与显式 session scope。
+`mcpServer/elicitation/request` 显示完整已支持的 primitive form/URL，未知扩展语义仅 Decline/Cancel，turnId 可空。
+两类使用独立 interaction timeline row。Legacy、机器面未实现方法及未知 method 在 ingress 错误答复，不生成不可操作卡片。
+`codex.serverRequestFailed` 包含 `{ instanceId, threadId, turnId, message }`；说明来自客户端，不改变 app-server turn outcome。
+`warning` 的原始 message 显示为会话系统警告或全局提示，包含上游对 unsupported service tier 的解释。
+
+TerminalGateway 显式使用 ApiKeyGuard 和 gateway-local exception filter，鉴权拒绝也通过 typed ACK 返回。终端错误 ACK 保留 `errorCode` / `params`，传输超时与 session_lost、not_found、closed、context_mismatch、socket_not_attached、recovery_limit、launch_failed 分开。详见 [terminal.md](terminal.md)。

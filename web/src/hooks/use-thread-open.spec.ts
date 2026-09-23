@@ -4,13 +4,16 @@ import type { ThreadOpenResponseDto, TurnDto } from '@/generated/api';
 import { useTimelineStore } from '@/stores/timeline-store';
 import { useModelStore } from '@/stores/model-store';
 import { nextObservationSeq } from '@/lib/turn-item-merge';
-import { applyOpenResponse } from './use-thread-open';
+import { restoreHistoryBookmark } from '@/lib/restore-history-bookmark';
+import { applyOpenResponse, applyReadOnlySnapshot } from './use-thread-open';
 
 vi.mock('@/socket', () => ({ getSocket: () => ({ emit: vi.fn() }) }));
 vi.mock('@/stores/thread-policy-store', () => ({
+  useThreadPolicyStore: { getState: () => ({ pendingByThread: {} }) },
   refreshThreadPolicy: vi.fn(async () => undefined), settleIfObserved: vi.fn(), forgetThreadPolicy: vi.fn(),
 }));
-vi.mock('@/lib/thread-recovery', () => ({ recoverTurnItems: vi.fn() }));
+vi.mock('@/lib/restore-history-bookmark', () => ({ restoreHistoryBookmark: vi.fn(async () => undefined) }));
+vi.mock('@/lib/thread-recovery', () => ({ recoverThreadAfterReconnect: vi.fn(async () => true) }));
 vi.mock('@/generated/api/sdk.gen', () => ({
   tokenUsageReadThreadTokenUsage: vi.fn(async () => ({})),
   turnDiffReadThreadTurnDiffs: vi.fn(async () => ({})),
@@ -19,7 +22,7 @@ vi.mock('@/generated/api/sdk.gen', () => ({
 const pristine = useTimelineStore.getState();
 const pristineModels = useModelStore.getState();
 const running: TurnDto = {
-  id: 'turn', status: 'inProgress', items: [], itemsView: 'summary', error: null,
+  id: 'turn', status: 'inProgress', items: [], itemsView: 'full', error: null,
   startedAt: null, completedAt: null, durationMs: null,
 };
 function response(): ThreadOpenResponseDto {
@@ -43,39 +46,49 @@ beforeEach(() => {
   useTimelineStore.getState().ensureThreadState({ threadId: 't' });
 });
 
-describe('open response authority', () => {
-  it('does not revive a turn completed while opening', () => {
+describe('open response authority', async () => {
+  it('does not revive a turn completed while opening', async () => {
     const baseline = nextObservationSeq();
     useTimelineStore.getState().updateCurrentTurnForThread('t', 'turn', () => ({ items: [], completed: true }));
-    applyOpenResponse(response(), baseline);
-    expect(useTimelineStore.getState().getThreadRuntime('t')).toMatchObject({ activeTurnId: null, loading: false });
+    await applyOpenResponse(response(), baseline);
+    expect(useTimelineStore.getState().getThreadRuntime('t')).toMatchObject({ activeTurnId: null, turnStartPending: false });
   });
 
-  it('does not overwrite settings observed after the open request', () => {
+  it('does not overwrite settings observed after the open request', async () => {
     const baseline = nextObservationSeq();
     useModelStore.getState().setObservedThreadSettings('t', { effort: 'high', serviceTier: 'fast' }, nextObservationSeq());
-    applyOpenResponse(response(), baseline);
+    await applyOpenResponse(response(), baseline);
     expect(useModelStore.getState().observedEffortByThread.t).toBe('high');
     expect(useModelStore.getState().observedServiceTierByThread.t).toBe('fast');
   });
 
-  it('does not claim freshness when a caller has no request baseline', () => {
+  it('does not claim freshness when a caller has no request baseline', async () => {
     useModelStore.getState().setObservedThreadSettings('t', { effort: 'high', serviceTier: 'fast' }, nextObservationSeq());
-    applyOpenResponse(response());
+    await applyOpenResponse(response());
     expect(useModelStore.getState().observedEffortByThread.t).toBe('high');
   });
 
-  it('orders concurrent opens even without intervening item or settings events', () => {
+  it('orders concurrent opens even without intervening item or settings events', async () => {
     const older = nextObservationSeq();
     const newer = nextObservationSeq();
-    applyOpenResponse({ ...response(), reasoningEffort: 'high' }, newer);
-    applyOpenResponse(response(), older);
+    await applyOpenResponse({ ...response(), reasoningEffort: 'high' }, newer);
+    await applyOpenResponse(response(), older);
     expect(useModelStore.getState().observedEffortByThread.t).toBe('high');
   });
 
-  it('forgets the sequence alongside its model observations', () => {
+  it('forgets the sequence alongside its model observations', async () => {
     useModelStore.getState().setObservedThreadSettings('t', { effort: 'high', serviceTier: 'fast' }, nextObservationSeq());
     useModelStore.getState().forgetObservedThreadEffort('t');
     expect(useModelStore.getState().observedSettingsSeqByThread.t).toBeUndefined();
   });
+});
+
+it('keeps a degraded read-only open gated until its historical bookmark is recovered', async () => {
+  let finish!: () => void;
+  vi.mocked(restoreHistoryBookmark).mockReturnValueOnce(new Promise<void>((resolve) => { finish = resolve; }));
+  const opened = response();
+  const pending = applyReadOnlySnapshot({ thread: opened.thread }, opened.initialTurnsPage);
+  expect(useTimelineStore.getState().getThreadRuntime('t')?.openState).toBe('opening');
+  finish(); await pending;
+  expect(useTimelineStore.getState().getThreadRuntime('t')?.openState).toBe('ready');
 });
