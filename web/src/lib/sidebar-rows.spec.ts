@@ -29,6 +29,7 @@ function thread(id: string): ThreadDto {
     source: 'appServer',
     agentNickname: null,
     agentRole: null,
+    originator: null,
     gitInfo: null,
     name: null,
     turns: [],

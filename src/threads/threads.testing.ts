@@ -36,7 +36,7 @@ export function makeThreadFixture(
     status: { type: 'idle' },
     path: null,
     cwd: '/tmp',
-    cliVersion: '0.154.0',
+    cliVersion: '0.156.1',
     source: 'appServer',
     threadSource: null,
     agentNickname: null,

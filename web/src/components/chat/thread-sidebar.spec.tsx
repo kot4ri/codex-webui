@@ -77,6 +77,7 @@ function row(id: string, members = [id]): ThreadOverviewRowDto {
       source: 'appServer',
       agentNickname: null,
       agentRole: null,
+      originator: null,
       gitInfo: null,
       name: id,
       turns: [],
