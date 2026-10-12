@@ -60,8 +60,14 @@ jobs:
           else
             SHORT_SHA=$(git rev-parse --short HEAD)
             echo "version_tag=dev-${SHORT_SHA}" >> $GITHUB_OUTPUT
-            # Use default from Dockerfile
-            echo "codex_version=" >> $GITHUB_OUTPUT
+            CODEX_VERSION=$(node -p "require('./package.json').devDependencies['@openai/codex']")
+            echo "codex_version=${CODEX_VERSION}" >> $GITHUB_OUTPUT
+          fi
+
+          PINNED_VERSION=$(node -p "require('./package.json').devDependencies['@openai/codex']")
+          if [[ "$CODEX_VERSION" != "$PINNED_VERSION" ]]; then
+            echo "::error::Image Codex version ($CODEX_VERSION) must match package.json ($PINNED_VERSION)"
+            exit 1
           fi
 
       - name: Set up Docker Buildx
@@ -83,7 +89,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/${{ matrix.arch }}
           build-args: |
-            CODEX_CLI_VERSION=${{ steps.meta.outputs.codex_version || '0.153.2' }}
+            CODEX_CLI_VERSION=${{ steps.meta.outputs.codex_version }}
           tags: |
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:${{ matrix.arch }}-${{ steps.meta.outputs.version_tag }}
           push: true
@@ -104,7 +110,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/${{ matrix.arch }}
           build-args: |
-            CODEX_CLI_VERSION=${{ steps.meta.outputs.codex_version || '0.153.2' }}
+            CODEX_CLI_VERSION=${{ steps.meta.outputs.codex_version }}
           tags: |
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:${{ matrix.arch }}-${{ steps.meta.outputs.version_tag }}
           push: true

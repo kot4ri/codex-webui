@@ -32,7 +32,7 @@ function response(): ThreadOpenResponseDto {
       id: 't', name: 'thread', preview: '', status: { type: 'idle' }, cwd: '/workspace',
       forkedFromId: null, ephemeral: false, modelProvider: 'test', model: null,
       reasoningEffort: null, createdAt: 0, updatedAt: 0, path: null,
-      cliVersion: '0.156.1', source: 'appServer', agentNickname: null,
+      cliVersion: '0.162.1', source: 'appServer', agentNickname: null,
       agentRole: null, originator: null, gitInfo: null, turns: [],
     },
     reasoningEffort: 'low', serviceTier: null,

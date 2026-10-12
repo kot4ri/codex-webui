@@ -23,6 +23,7 @@
 - Markdown 渲染 + Shiki 代码高亮
 - `@` 引用文件、粘贴图片
 - 追问（steer）和中断（stop）正在执行的 turn
+- 选项回答：助手提出问题后可单选建议或输入自定义回答，运行中追问、结束后开启下一轮；支持多题一起提交
 
 **消息级分支**
 - 编辑任意一条历史消息即产生新版本，像 ChatGPT 一样在版本间左右切换
@@ -248,8 +249,8 @@ Docker Compose 中使用时，`proxy_pass` 改为 `http://codex-webui:8172`，�
 
 ```bash
 docker build \
-  --build-arg CODEX_CLI_VERSION=0.156.1 \
-  -t codex-webui:0.156.1 .
+  --build-arg CODEX_CLI_VERSION=0.162.1 \
+  -t codex-webui:0.162.1 .
 ```
 
 Nginx 必须保留浏览器侧的 `/codex/` 前缀，并在转发到后端时将它移除。`location` 和 `proxy_pass` 末尾的 `/` 均不可省略：

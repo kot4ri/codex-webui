@@ -23,6 +23,7 @@ The backend (NestJS) talks to `codex app-server` over stdio JSON-RPC and pushes 
 - Markdown rendering + Shiki syntax highlighting
 - `@` file mentions, image paste
 - Steer/stop running turns
+- Answer assistant questions with a suggested option or custom text; submit multiple answers together, steering an active turn or starting the next turn when idle
 
 **Message-Level Branching**
 - Editing any past message creates a new version; switch between them like ChatGPT
@@ -248,8 +249,8 @@ The same image can serve both a domain root and a proxy subpath (for example, `h
 
 ```bash
 docker build \
-  --build-arg CODEX_CLI_VERSION=0.156.1 \
-  -t codex-webui:0.156.1 .
+  --build-arg CODEX_CLI_VERSION=0.162.1 \
+  -t codex-webui:0.162.1 .
 ```
 
 Nginx must retain `/codex/` in browser-facing URLs and strip it when proxying to the backend. The trailing slashes on both `location` and `proxy_pass` are required:
