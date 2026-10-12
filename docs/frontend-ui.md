@@ -173,7 +173,8 @@ Tailwind v4 的 `hover:` / `group-hover:` 变体**本身就编译在 `@media (ho
 
 - **GitDiffPanel** (`turn-items/git-diff-panel.tsx`)：封装 DiffView，集中处理 Shiki 懒加载（模块级单例）、theme（从 `useThemeStore` 读取）、Unified/Split 切换、parse 失败 raw fallback（DiffRenderBoundary error boundary）。
 - **file-change-item / file-change-set**：两种审批呈现共用完整 change-set renderer，逐文件显示路径、操作种类与 rename 目标。审批内联时优先展示 request-owned review subject，完整主体用 GitDiffPanel；未持有完整主体的普通 item 流式阶段保留 raw diff。
-- **user-input-card** (`turn-items/user-input-card.tsx`)：渲染 `item/tool/requestUserInput`（EXPERIMENTAL）。支持 radio（单选）/ checkbox（isOther+多选）/ text / password。提交通过 `pendingApprovalsRespond` REST，写入期间禁止重复提交，完成回调校验原 thread/instance；submitted 与原生 resolved 分开。蓝色边框(pending) / 灰色(resolved)。
+- **user-input-card** (`turn-items/user-input-card.tsx`)：渲染 `item/tool/requestUserInput`（EXPERIMENTAL）。支持 radio（单选）/ text / password；`isOther` 表示允许自定义回答，不表示多选，自定义回答与选项互斥。提交通过 `pendingApprovalsRespond` REST，写入期间禁止重复提交，完成回调校验原 thread/instance；submitted 与原生 resolved 分开。蓝色边框(pending) / 灰色(resolved)。
+- **async-question-card** (`turn-items/async-question-card.tsx`)：把 `agentMessage.questions` 渲染成可回答的表单。每题单选建议或自定义输入，无选项时输入文本，多题一起提交。首个建议可预选，但只有点击发送才提交；运行中调用 steer，空闲时调用 start，保留聊天输入框草稿。回答作为普通用户消息发送，不伪造 approval response 或创建会话分支。只读、已删除、待审批、策略切换期间禁止发送。以 thread/item 为键保存当前页面会话的草稿与提交状态，虚拟列表重挂载不丢失；刷新页面不恢复这份临时状态。网络结果不明确时提示检查对话，不自动重试或转为新一轮。
 
 ## 审批呈现
 

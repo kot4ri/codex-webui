@@ -989,5 +989,10 @@
   "Close the other document at this destination before saving.": "请先关闭目标路径对应的另一个文档，再保存。",
   "Unsaved files no longer on disk": "已从磁盘移除的未保存文件",
   "Recover {{name}}": "恢复 {{name}}",
-  "Discard unsaved changes?": "放弃未保存的更改？"
+  "Discard unsaved changes?": "放弃未保存的更改？",
+  "Choose the next step": "选择下一步操作",
+  "Type your answer": "输入你的回答",
+  "Send answer": "发送回答",
+  "Answer sent": "回答已发送",
+  "Delivery unconfirmed. Check the conversation before sending again.": "尚未确认送达，请检查对话后再决定是否重新发送。"
 }

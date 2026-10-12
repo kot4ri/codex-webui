@@ -70,24 +70,14 @@ export function UserInputCard({ request }: Props) {
   const setSingle = (qId: string, value: string) => {
     setDraft((prev) => ({
       ...prev,
-      [qId]: { ...(prev[qId] ?? { selected: [], text: '' }), selected: [value] },
+      [qId]: { ...(prev[qId] ?? { selected: [], text: '' }), selected: [value], text: '' },
     }));
-  };
-
-  const toggle = (qId: string, value: string) => {
-    setDraft((prev) => {
-      const existing = prev[qId] ?? { selected: [], text: '' };
-      const selected = existing.selected.includes(value)
-        ? existing.selected.filter((v) => v !== value)
-        : [...existing.selected, value];
-      return { ...prev, [qId]: { ...existing, selected } };
-    });
   };
 
   const setText = (qId: string, value: string) => {
     setDraft((prev) => ({
       ...prev,
-      [qId]: { ...(prev[qId] ?? { selected: [], text: '' }), text: value },
+      [qId]: { ...(prev[qId] ?? { selected: [], text: '' }), text: value, selected: [] },
     }));
   };
 
@@ -125,8 +115,6 @@ export function UserInputCard({ request }: Props) {
         {request.questions.map((question) => {
           const d = draft[question.id] ?? { selected: [], text: '' };
           const options = question.options ?? [];
-          // isOther + options = multi-select (checkboxes); otherwise radio
-          const useCheckboxes = question.isOther && options.length > 0;
 
           return (
             <div key={question.id} className="space-y-2">
@@ -143,14 +131,13 @@ export function UserInputCard({ request }: Props) {
                       className="flex cursor-pointer items-start gap-2 rounded-md border border-border/60 px-2 py-1.5 hover:bg-accent/30"
                     >
                       <input
-                        type={useCheckboxes ? 'checkbox' : 'radio'}
+                        type="radio"
                         name={`${request.requestId}-${question.id}`}
                         className="mt-0.5 h-3.5 w-3.5 accent-primary"
                         checked={d.selected.includes(opt.label)}
                         disabled={!isPending || submitting}
                         onChange={() => {
-                          if (useCheckboxes) toggle(question.id, opt.label);
-                          else setSingle(question.id, opt.label);
+                          setSingle(question.id, opt.label);
                         }}
                       />
                       <span className="min-w-0">
@@ -167,8 +154,9 @@ export function UserInputCard({ request }: Props) {
               )}
 
               {/* Free-text input (shown if no options, or isOther allows extra text) */}
-              {(!question.options || question.isOther) && (
+              {(options.length === 0 || question.isOther) && (
                 <Input
+                  aria-label={`${question.header}: ${t(question.isOther ? 'Other answer' : 'Answer')}`}
                   type={question.isSecret ? 'password' : 'text'}
                   value={d.text}
                   disabled={!isPending || submitting}
