@@ -64,6 +64,7 @@ function model(overrides: Partial<v2.Model> = {}): v2.Model {
     upgrade: null,
     upgradeInfo: null,
     availabilityNux: null,
+    availableAccessPrograms: null,
     displayName: 'GPT-5',
     description: 'Default model',
     modelSpecialty: null,

@@ -322,6 +322,7 @@ function threadSettings(
   effort: v2.ThreadSettings['effort'],
 ): v2.ThreadSettings {
   return {
+    disabledPluginIds: [],
     cwd: '/workspace',
     approvalPolicy: 'never',
     approvalsReviewer: 'user',

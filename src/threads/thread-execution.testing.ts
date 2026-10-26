@@ -61,6 +61,7 @@ export function executionTurn(
 ): v2.Turn {
   return {
     id,
+    rootTurnId: null,
     status,
     items: [],
     itemsView: 'notLoaded',

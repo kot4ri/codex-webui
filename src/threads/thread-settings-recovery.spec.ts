@@ -18,6 +18,7 @@ describe('settings freshness across thread opens', () => {
   let observer: ThreadSettingsObserverService;
   let registry: ThreadResumeRegistryService;
   const settings: v2.ThreadSettings = {
+    disabledPluginIds: [],
     cwd: '/new',
     model: 'new-model',
     modelProvider: 'openai',
@@ -40,6 +41,8 @@ describe('settings freshness across thread opens', () => {
   };
   const response = () => ({
     thread: makeThreadFixture({ id: 't1' }),
+    disabledPluginIds: [],
+    collaborationMode: null,
     cwd: '/old',
     model: 'old-model',
     modelProvider: 'openai',

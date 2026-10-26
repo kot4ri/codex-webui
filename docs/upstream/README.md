@@ -22,7 +22,7 @@ measured behaviour recorded there is the one the code was written against.
 
 ## Bundled model catalog
 
-`model-catalog-0.162.1.json` is the complete deterministic output of the pinned binary's
+`model-catalog-0.164.0.json` is the complete deterministic output of the pinned binary's
 `codex debug models --bundled`, including instruction text and hidden entries. Refresh
 with `pnpm codex:catalog`; update the script's versioned target when bumping the CLI.
 It is a bundled baseline, not an authenticated account's effective remote catalog.

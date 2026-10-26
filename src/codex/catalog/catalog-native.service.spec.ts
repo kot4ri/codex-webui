@@ -20,7 +20,7 @@ import { writeAtomic } from './catalog-files';
 import type { v2 } from '../codex-schema';
 
 const baseline = readFileSync(
-  resolve('docs/upstream/model-catalog-0.162.1.json'),
+  resolve('docs/upstream/model-catalog-0.164.0.json'),
   'utf8',
 );
 
