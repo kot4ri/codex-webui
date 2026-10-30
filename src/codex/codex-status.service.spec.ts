@@ -16,7 +16,12 @@ function accountResponse(
   overrides: Partial<v2.GetAccountResponse> = {},
 ): v2.GetAccountResponse {
   return {
-    account: { type: 'chatgpt', email: 'user@example.com', planType: 'plus' },
+    account: {
+      type: 'chatgpt',
+      email: 'user@example.com',
+      planType: 'plus',
+      workspaceName: null,
+    },
     requiresOpenaiAuth: false,
     ...overrides,
   };

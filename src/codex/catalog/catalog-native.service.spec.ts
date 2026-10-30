@@ -20,7 +20,7 @@ import { writeAtomic } from './catalog-files';
 import type { v2 } from '../codex-schema';
 
 const baseline = readFileSync(
-  resolve('docs/upstream/model-catalog-0.164.0.json'),
+  resolve('docs/upstream/model-catalog-0.166.0.json'),
   'utf8',
 );
 
@@ -48,7 +48,10 @@ describe('pinned catalog parser and lifecycle', () => {
     const exported = await native.bundled();
     expect(JSON.parse(exported)).toEqual(JSON.parse(baseline));
     const catalog = await native.validate(exported);
-    expect(catalog.models).toHaveLength(11);
+    expect(catalog.models).toHaveLength(12);
+    expect(catalog.models.some((entry) => entry.slug === 'gpt-6.1-terra')).toBe(
+      true,
+    );
     expect(catalog.models.some((entry) => entry.visibility === 'hide')).toBe(
       true,
     );
@@ -74,7 +77,7 @@ describe('pinned catalog parser and lifecycle', () => {
     const cache = join(fixture.home, 'models_cache.json');
     const original = '{"models":[],"sentinel":"preserve"}';
     writeFileSync(cache, original);
-    expect(parseCatalog(await native.effective()).models).toHaveLength(11);
+    expect(parseCatalog(await native.effective()).models).toHaveLength(12);
     expect(readFileSync(cache, 'utf8')).toBe(original);
   }, 25_000);
   it('aborts pending activation before spawn and checks real idle/unmaterialized thread RPCs', async () => {
