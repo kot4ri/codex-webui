@@ -22,6 +22,7 @@ function accountResponse(
       planType: 'plus',
       workspaceName: null,
     },
+    userId: null,
     requiresOpenaiAuth: false,
     ...overrides,
   };

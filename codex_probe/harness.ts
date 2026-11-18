@@ -225,7 +225,7 @@ export class AppServer {
    */
   requestRaw<Result = unknown>(
     method: string,
-    params?: Record<string, unknown>,
+    params?: Record<string, unknown> | null,
     timeoutMs = 30_000,
   ): Promise<RpcReply<Result>> {
     return new Promise((resolve, reject) => {
